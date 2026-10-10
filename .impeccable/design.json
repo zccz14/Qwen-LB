@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-07-15T00:00:00+08:00",
-  "title": "Design System: DeepSeek-LB",
+  "generatedAt": "2026-10-10T08:02:46+08:00",
+  "title": "Design System: Qwen-LB",
   "extensions": {
     "colorMeta": {
       "background": {
@@ -100,7 +100,7 @@
       "kind": "button",
       "refersTo": "button-primary",
       "description": "The single primary action within a task region.",
-      "html": "<button class=\"ds-btn-primary\" type=\"button\">Create API key</button>",
+      "html": "<button class=\"ds-btn-primary\" type=\"button\">Create Consumer</button>",
       "css": ".ds-btn-primary{height:36px;padding:8px 12px;border:0;border-radius:8px;background:oklch(0.205 0 0);color:oklch(0.985 0 0);font:500 14px/1.4 'Geist Variable',Geist,sans-serif;transition:background 150ms cubic-bezier(.25,1,.5,1)}.ds-btn-primary:hover{background:oklch(0.269 0 0)}.ds-btn-primary:active{background:oklch(0.145 0 0)}.ds-btn-primary:focus-visible{outline:0;box-shadow:0 0 0 3px oklch(0.708 0 0/.5)}.ds-btn-primary:disabled{cursor:not-allowed;opacity:.5}"
     },
     {
@@ -116,13 +116,13 @@
       "kind": "input",
       "refersTo": "input",
       "description": "Compact operational forms and filters.",
-      "html": "<label class=\"ds-field\"><span>API key name</span><input class=\"ds-input\" value=\"Production gateway\" /></label>",
+      "html": "<label class=\"ds-field\"><span>Provider name</span><input class=\"ds-input\" value=\"Production Qwen upstream\" /></label>",
       "css": ".ds-field{display:flex;flex-direction:column;gap:8px;color:oklch(0.556 0 0);font:500 12px/1.4 'Geist Variable',Geist,sans-serif}.ds-input{height:36px;padding:8px 12px;border:1px solid oklch(0.922 0 0);border-radius:8px;background:oklch(1 0 0);color:oklch(0.145 0 0);font:400 14px/1.5 'Geist Variable',Geist,sans-serif;transition:border-color 150ms cubic-bezier(.25,1,.5,1)}.ds-input:hover{border-color:oklch(0.708 0 0)}.ds-input:focus-visible{outline:0;border-color:oklch(0.708 0 0);box-shadow:0 0 0 3px oklch(0.708 0 0/.5)}.ds-input:disabled{cursor:not-allowed;opacity:.5}"
     },
     {
-      "name": "Channel Status Badge",
+      "name": "Provider Status Badge",
       "kind": "chip",
-      "description": "Text-first channel health and rate-limit state.",
+      "description": "Text-first provider health and rate-limit state.",
       "html": "<span class=\"ds-badge\"><svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><circle cx=\"8\" cy=\"8\" r=\"3\" fill=\"currentColor\"/></svg>Available</span>",
       "css": ".ds-badge{display:inline-flex;height:24px;align-items:center;gap:4px;padding:0 8px;border-radius:6px;background:oklch(0.97 0 0);color:oklch(0.205 0 0);font:500 12px/1.4 'Geist Variable',Geist,sans-serif}.ds-badge svg{width:14px;height:14px}.ds-badge:focus-visible{outline:0;box-shadow:0 0 0 3px oklch(0.708 0 0/.5)}"
     },
@@ -131,23 +131,31 @@
       "kind": "card",
       "refersTo": "panel",
       "description": "A bounded group for related status or controls, flat at rest.",
-      "html": "<section class=\"ds-panel\"><header><strong>Channel health</strong><span>12 available</span></header><p>Rate-limit and recovery state across registered OAuth channels.</p></section>",
+      "html": "<section class=\"ds-panel\"><header><strong>Provider health</strong><span>12 available</span></header><p>Rate-limit and recovery state across registered Qwen upstream providers.</p></section>",
       "css": ".ds-panel{padding:20px;border:1px solid oklch(0.922 0 0);border-radius:10px;background:oklch(1 0 0);color:oklch(0.145 0 0);font:400 14px/1.5 'Geist Variable',Geist,sans-serif}.ds-panel header{display:flex;align-items:center;justify-content:space-between;gap:16px}.ds-panel strong{font-weight:600}.ds-panel header span,.ds-panel p{color:oklch(0.556 0 0)}.ds-panel p{max-width:65ch;margin:8px 0 0}"
     },
     {
       "name": "Sidebar Navigation Item",
       "kind": "nav",
       "description": "Current location in the authenticated operations shell.",
-      "html": "<a class=\"ds-nav-item\" href=\"#\" aria-current=\"page\"><svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path d=\"M2 3.5h12v2H2zm0 3.5h12v2H2zm0 3.5h12v2H2z\" fill=\"currentColor\"/></svg>Audit logs</a>",
+      "html": "<a class=\"ds-nav-item\" href=\"#\" aria-current=\"page\"><svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path d=\"M2 3.5h12v2H2zm0 3.5h12v2H2zm0 3.5h12v2H2z\" fill=\"currentColor\"/></svg>Inference audit</a>",
       "css": ".ds-nav-item{display:flex;height:36px;align-items:center;gap:8px;padding:0 10px;border-radius:8px;background:oklch(0.97 0 0);color:oklch(0.205 0 0);font:600 14px/1.5 'Geist Variable',Geist,sans-serif;text-decoration:none;transition:background 150ms cubic-bezier(.25,1,.5,1)}.ds-nav-item svg{width:16px;height:16px}.ds-nav-item:hover{background:oklch(0.922 0 0)}.ds-nav-item:focus-visible{outline:0;box-shadow:0 0 0 3px oklch(0.708 0 0/.5)}"
+    },
+    {
+      "name": "Voice Result Block",
+      "kind": "card",
+      "description": "Transcription text or synthesized audio paired with the unified request ID and an audit link.",
+      "html": "<section class=\"ds-voice-result\"><header><strong>Transcription</strong><span>2.5 s audio</span></header><p>欢迎使用阿里云。</p><footer><span>Request ID: 8f3c…</span><a href=\"#\">Open in audit</a></footer></section>",
+      "css": ".ds-voice-result{padding:20px;border:1px solid oklch(0.922 0 0);border-radius:10px;background:oklch(1 0 0);color:oklch(0.145 0 0);font:400 14px/1.5 'Geist Variable',Geist,sans-serif}.ds-voice-result header{display:flex;align-items:center;justify-content:space-between;gap:16px}.ds-voice-result strong{font-weight:600}.ds-voice-result header span{color:oklch(0.556 0 0);font:500 12px/1.4 'Geist Variable',Geist,sans-serif}.ds-voice-result p{max-width:65ch;margin:8px 0 0}.ds-voice-result footer{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:16px;margin-top:12px;color:oklch(0.556 0 0);font:500 12px/1.4 'Geist Variable',Geist,sans-serif}.ds-voice-result a{color:oklch(0.205 0 0)}"
     }
   ],
   "narrative": {
-    "northStar": "The Operations Ledger",
-    "overview": "这套界面像一份持续更新、可立即采取行动的运维账本：以中性表面、细边界和明确的文字层级组织高密度状态。它继承 1Exchange 的冷静与精确，不把代理基础设施包装成营销产品；任何视觉强调都必须对应操作、选择、异常或恢复状态。\n\n桌面端采用稳定的侧栏与内容区，数据密集页面以工具栏、筛选器和表格为主；移动端将侧栏折叠为 Sheet，并让宽表格在 ScrollArea 中保留列标题和上下文。shadcn/ui 是唯一基础组件语言，优先组合 Sidebar、Breadcrumb、Tabs、Table、Badge、Alert、Dialog、Sheet、DropdownMenu、Pagination、Skeleton、Empty 与 sonner，而非自制等价控件。",
+    "northStar": "The Voice Ledger",
+    "overview": "这套界面像一份持续更新、可立即采取行动的语音运维账本：以中性表面、细边界和明确的文字层级组织高密度状态。它继承 1Exchange 的冷静与精确，不把语音基础设施包装成营销产品；任何视觉强调都必须对应操作、选择、异常或恢复状态。\n\n语音工坊是一等公民：一次试转写或试合成结束后，结果（文本或音频）、统一请求 ID 与审计入口必须同屏出现，费用快照与累计消费可以在推理审计中逐一核对。桌面端采用稳定的侧栏与内容区，数据密集页面以工具栏、筛选器和表格为主；移动端将侧栏折叠为 Sheet，并让宽表格在 ScrollArea 中保留列标题和上下文。shadcn/ui 是唯一基础组件语言，优先组合 Sidebar、Breadcrumb、Tabs、Table、Badge、Alert、Dialog、Sheet、DropdownMenu、Pagination、Skeleton、Empty 与 sonner，而非自制等价控件。",
     "keyCharacteristics": [
       "高密度、低装饰、清晰层级。",
       "状态先于汇总，原因先于情绪化提示。",
+      "语音结果、统一请求 ID、审计入口同屏；用量以音频秒数/合成字符数呈现。",
       "单一中性强调色，危险状态只在需要介入时出现。",
       "中英文均能自然扩展，关键上下文不被截断。",
       "状态变化使用 150–200ms 的克制过渡；减少动态模式下即时切换。"
@@ -163,8 +171,9 @@
     ],
     "dos": [
       "Do 使用 shadcn/ui 现有组件和语义变体组合页面，保持同一操作在各处具有同一外观与行为。",
-      "Do 把渠道健康、限流余量、冷却截止时间、禁用原因和恢复条件放在同一可扫描上下文中。",
-      "Do 用表格承载 API Key 用量和逐次调用审计，并提供时间、租户、Key、渠道、能力与结果筛选。",
+      "Do 把上游提供商健康、限流余量、冷却截止时间、禁用原因和恢复条件放在同一可扫描上下文中。",
+      "Do 用表格承载 Consumer 用量和逐次调用审计，并提供时间、租户、Consumer、上游提供商、模型、结果与用量（秒/字符）筛选。",
+      "Do 让语音工坊的结果区同时给出文本或音频、统一请求 ID 与“前往审计”入口。",
       "Do 使用 10px 面板圆角、8px 控件圆角、1px 边界和 20px 面板内边距作为默认密度基线。",
       "Do 为键盘焦点、加载、空、错误、禁用和权限不足状态提供完整反馈；所有过渡尊重 prefers-reduced-motion。",
       "Do 让中文和英文标签可增长，并为完整值提供 Tooltip、Sheet 或复制入口。"
@@ -175,7 +184,7 @@
       "Don't 把普通卡片、输入或区块做成 24px 以上圆角；内容表面上限为 14px。",
       "Don't 用模态框作为默认交互；优先内联编辑、展开详情或 Sheet，只在必须阻断流程时使用 Dialog。",
       "Don't 隐藏限流、禁用或恢复原因，也不要仅显示“失败”而不给时间、请求 ID 和下一步。",
-      "Don't 在 UI、日志或复制操作中暴露完整 access_key、refresh_key 或租户 API Key。"
+      "Don't 在 UI、日志或复制操作中暴露完整上游 API Key 或 Consumer 凭据；一次性 Consumer 密钥只在创建时展示。"
     ]
   }
 }

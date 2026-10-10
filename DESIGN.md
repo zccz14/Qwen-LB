@@ -1,6 +1,6 @@
 ---
-name: DeepSeek-LB
-description: Calm, precise operations console for the DeepSeek API load balancer
+name: Qwen-LB
+description: Calm, precise operations console for the Qwen voice API reverse proxy and load balancer
 colors:
   background: "oklch(1 0 0)"
   foreground: "oklch(0.145 0 0)"
@@ -81,20 +81,21 @@ components:
     padding: "20px"
 ---
 
-# Design System: DeepSeek-LB
+# Design System: Qwen-LB
 
 ## Overview
 
-**Creative North Star: "The Operations Ledger"**
+**Creative North Star: “The Voice Ledger”（语音账本）**
 
-这套界面像一份持续更新、可立即采取行动的运维账本：以中性表面、细边界和明确的文字层级组织高密度状态。它继承 1Exchange 的冷静与精确，不把代理基础设施包装成营销产品；任何视觉强调都必须对应操作、选择、异常或恢复状态。
+这套界面像一份持续更新、可立即采取行动的语音运维账本：以中性表面、细边界和明确的文字层级组织高密度状态。它继承 1Exchange 的冷静与精确，不把语音基础设施包装成营销产品；任何视觉强调都必须对应操作、选择、异常或恢复状态。
 
-桌面端采用稳定的侧栏与内容区，数据密集页面以工具栏、筛选器和表格为主；移动端将侧栏折叠为 Sheet，并让宽表格在 ScrollArea 中保留列标题和上下文。shadcn/ui 是唯一基础组件语言，优先组合 Sidebar、Breadcrumb、Tabs、Table、Badge、Alert、Dialog、Sheet、DropdownMenu、Pagination、Skeleton、Empty 与 sonner，而非自制等价控件。
+语音工坊是一等公民：一次试转写或试合成结束后，结果（文本或音频）、统一请求 ID 与审计入口必须同屏出现，费用快照与累计消费可以在推理审计中逐一核对。桌面端采用稳定的侧栏与内容区，数据密集页面以工具栏、筛选器和表格为主；移动端将侧栏折叠为 Sheet，并让宽表格在 ScrollArea 中保留列标题和上下文。shadcn/ui 是唯一基础组件语言，优先组合 Sidebar、Breadcrumb、Tabs、Table、Badge、Alert、Dialog、Sheet、DropdownMenu、Pagination、Skeleton、Empty 与 sonner，而非自制等价控件。
 
 **Key Characteristics:**
 
 - 高密度、低装饰、清晰层级。
 - 状态先于汇总，原因先于情绪化提示。
+- 语音结果、统一请求 ID、审计入口同屏；用量以音频秒数/合成字符数呈现。
 - 单一中性强调色，危险状态只在需要介入时出现。
 - 中英文均能自然扩展，关键上下文不被截断。
 - 状态变化使用 150–200ms 的克制过渡；减少动态模式下即时切换。
@@ -200,15 +201,20 @@ components:
 
 ### Audit Event Row
 
-审计行固定展示时间、租户、Consumer 前缀、上游提供商、模型、状态、耗时、用量与请求 ID。原始详情在 Sheet 中按字段分组展示；敏感头与上游密钥必须脱敏，复制操作逐项授权并留下管理审计记录。
+审计行固定展示时间、租户、Consumer 前缀、上游提供商、模型、状态、耗时、音频秒数/合成字符数、费用快照与统一请求 ID。原始详情在 Sheet 中按字段分组展示；敏感头与上游密钥必须脱敏，复制操作逐项授权并留下管理审计记录。
+
+### Voice Results
+
+语音工坊的转写结果以可复制的文本块呈现；合成结果提供原生 audio 播放器、下载按钮和 WAV 格式说明。两者都必须同屏给出统一请求 ID，以及“已记入推理审计”的说明与跳转入口（费用快照与累计消费在审计中核对）。空态说明如何开始（选择文件或输入文本），失败态用 Alert 给出原因与修复建议，禁止只给颜色。
 
 ## Do's and Don'ts
 
 ### Do:
 
 - **Do** 使用 shadcn/ui 现有组件和语义变体组合页面，保持同一操作在各处具有同一外观与行为。
-- **Do** 把上游提供商健康、冷却截止时间、禁用原因和恢复条件放在同一可扫描上下文中。
-- **Do** 用表格承载 Consumer 用量和逐次调用审计，并提供时间、租户、Consumer、上游提供商、模型与结果筛选。
+- **Do** 把上游提供商健康、限流余量、冷却截止时间、禁用原因和恢复条件放在同一可扫描上下文中。
+- **Do** 用表格承载 Consumer 用量和逐次调用审计，并提供时间、租户、Consumer、上游提供商、模型、结果与用量（秒/字符）筛选。
+- **Do** 让语音工坊的结果区同时给出文本或音频、统一请求 ID 与“前往审计”入口。
 - **Do** 使用 10px 面板圆角、8px 控件圆角、1px 边界和 20px 面板内边距作为默认密度基线。
 - **Do** 为键盘焦点、加载、空、错误、禁用和权限不足状态提供完整反馈；所有过渡尊重 `prefers-reduced-motion`。
 - **Do** 让中文和英文标签可增长，并为完整值提供 Tooltip、Sheet 或复制入口。
@@ -220,4 +226,4 @@ components:
 - **Don't** 把普通卡片、输入或区块做成 24px 以上圆角；内容表面上限为 14px。
 - **Don't** 用模态框作为默认交互；优先内联编辑、展开详情或 Sheet，只在必须阻断流程时使用 Dialog。
 - **Don't** 隐藏限流、禁用或恢复原因，也不要仅显示“失败”而不给时间、请求 ID 和下一步。
-- **Don't** 在 UI、日志或复制操作中暴露完整 access_key、refresh_key 或租户 Consumer 凭据。
+- **Don't** 在 UI、日志或复制操作中暴露完整上游 API Key 或 Consumer 凭据；一次性 Consumer 密钥只在创建时展示。
