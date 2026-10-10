@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="Qwen-LB">
+  <defs>
+    <linearGradient id="qwen" x1="6" y1="6" x2="42" y2="42" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7C5CFF" />
+      <stop offset="1" stop-color="#3B82F6" />
+    </linearGradient>
+  </defs>
+  <rect width="48" height="48" rx="12" fill="url(#qwen)" />
+  <g fill="#FFFFFF">
+    <rect x="13" y="19" width="5" height="10" rx="2.5" />
+    <rect x="21.5" y="13" width="5" height="22" rx="2.5" />
+    <rect x="30" y="17" width="5" height="14" rx="2.5" />
+  </g>
+</svg>

@@ -1,27 +1,25 @@
 # Request cost queries
 
-Downstream services can look up the billed amount of one inference request, or
-of a batch of them, after the fact. The query key is the
-unified request ID (see below), so a caller records the ID while proxying or
-consuming responses and resolves costs later — including requests it
-cancelled, lost, or never finished reading.
+Downstream services can look up the billed amount of one voice request, or of
+a batch of them, after the fact. The query key is the unified request ID (see
+below), so a caller records the ID while consuming responses and resolves
+costs later — including requests it cancelled, lost, or never finished reading.
 
-Pricing stays inside each load balancer (peak/off-peak windows, price
-multipliers, model tables); clients consume final amounts only, and never need
-to model per-upstream pricing rules. Other load balancers in this ecosystem
-(OpenAI-LB) are expected to expose the same contract, so one client
-implementation covers every upstream.
+Pricing stays inside each load balancer (voice rate tables, per-unit
+conversion); clients consume final amounts only, and never need to model
+per-upstream pricing rules. Other load balancers in this ecosystem (OpenAI-LB)
+expose the same contract, so one client implementation covers every upstream.
 
 ## Unified request IDs
 
-When the caller supplies `x-normai-request-id` on the inference request
-(NormAI does this when it proxies), the load balancer adopts the value as the
-request's ID: the `x-deepseek-lb-request-id` response header, this query API,
-and the console audit all use the same value, so one identifier covers the
-whole chain. Invalid values (empty, longer than 128 bytes, or containing
-non-ASCII-graphic bytes) are ignored and a UUID is generated instead —
-misconfigured callers never fail inference. The header is consumed by the load
-balancer and is never forwarded to the model provider.
+When the caller supplies `x-normai-request-id` on the voice request (NormAI
+does this when it proxies), the load balancer adopts the value as the
+request's ID: the `x-qwen-lb-request-id` response header, this query API, and
+the console audit all use the same value, so one identifier covers the whole
+chain. Invalid values (empty, longer than 128 bytes, or containing non-ASCII
+graphic bytes) are ignored and a UUID is generated instead — misconfigured
+callers never fail inference. The header is consumed by the load balancer and
+is never forwarded to the model provider.
 
 Duplicate records for one ID are possible in rare cases (a transport-level
 re-send after a dropped connection); queries return the most recent record.
@@ -37,11 +35,10 @@ Authorization: Bearer <CONSUMER_KEY>
 {
   "request_id": "0f10ab1c-8d2f-4c0a-9b1e-3f5a7c9d1e2f",
   "status": 200,
-  "model": "deepseek-flash",
-  "input_tokens": 11,
-  "output_tokens": 5,
-  "cached_tokens": 3,
-  "cost_usd_nanos": 4209,
+  "model": "qwen-audio-3.0-asr-flash",
+  "audio_seconds": 2.5,
+  "characters": 0,
+  "cost_usd_nanos": 76390,
   "created_at": 1759360000
 }
 ```
@@ -49,10 +46,10 @@ Authorization: Bearer <CONSUMER_KEY>
 The handler waits up to 2 seconds for a just-finished request to settle and
 persist before answering. If the record is still unavailable it returns HTTP
 404 with `reason: request_not_found` and this service's own name in
-`error.lb` (`"deepseek"`): an upstream gateway probes this endpoint to
-recognise a load balancer and reads the field to learn which one it is, so
-web searches route by source. A client that knows the request has just
-finished may retry with backoff.
+`error.lb` (`"qwen"`): an upstream gateway probes this endpoint to recognise a
+load balancer and reads the field to learn which one it is, so requests route
+by source. A client that knows the request has just finished may retry with
+backoff.
 
 ## Batch records
 
@@ -67,9 +64,9 @@ Content-Type: application/json
 ```json
 {
   "requests": [
-    {"request_id": "0f10ab1c-…", "status": 200, "model": "deepseek-flash",
-     "input_tokens": 11, "output_tokens": 5, "cached_tokens": 3,
-     "cost_usd_nanos": 4209, "created_at": 1759360000}
+    {"request_id": "0f10ab1c-…", "status": 200, "model": "qwen3-tts-flash",
+     "audio_seconds": 0.0, "characters": 7,
+     "cost_usd_nanos": 77777, "created_at": 1759360000}
   ],
   "missing": ["4eef28a0-…"]
 }
@@ -94,7 +91,7 @@ capability values too. The console audit remains scoped per tenant.
 ## Backfill loop
 
 ```text
-pending := recorded request IDs (from x-deepseek-lb-request-id headers)
+pending := recorded request IDs (from x-qwen-lb-request-id headers)
 
 loop, every N minutes or once pending is large enough:
     batch    := up to 1000 IDs taken from pending
@@ -102,7 +99,7 @@ loop, every N minutes or once pending is large enough:
     store response.requests locally (amount + usage)
     pending  := (pending - batch) ∪ response.missing
     give up on IDs that stay missing for too long: settlement completes
-    milliseconds after the stream ends, so a permanently missing ID was most
+    milliseconds after the response ends, so a permanently missing ID was most
     likely dropped by a saturated audit queue or never existed
 ```
 
@@ -110,20 +107,22 @@ loop, every N minutes or once pending is large enough:
 
 | field | meaning |
 | --- | --- |
-| `request_id` | the unified request ID: the `x-normai-request-id` request header value when supplied, otherwise a generated UUID; it is echoed as `x-deepseek-lb-request-id` |
-| `status` | recorded HTTP status (499 is a client-cancelled stream) |
+| `request_id` | the unified request ID: the `x-normai-request-id` request header value when supplied, otherwise a generated UUID; it is echoed as `x-qwen-lb-request-id` |
+| `status` | recorded HTTP status (499 is a client-cancelled request) |
 | `model` | requested model; `null` when the request failed before parsing |
-| `input_tokens`, `output_tokens`, `cached_tokens` | billed token usage |
-| `cost_usd_nanos` | the amount actually charged, in USD nanodollars (1e-9 USD) |
+| `audio_seconds` | transcribed audio seconds as the upstream reported them (0 for synthesis) |
+| `characters` | synthesized output characters as the upstream reported them (0 for transcription) |
+| `cost_usd_nanos` | the amount charged, in USD nanodollars (1e-9 USD) |
 | `created_at` | request start time, Unix seconds |
 
-`cost_usd_nanos` equals `api_calls.actual_cost_usd_nanos` for the call — the
-same value the console audit shows and that user consumption accounting uses.
-It is read from the ledger at query time, never recomputed.
+`cost_usd_nanos` is computed when the upstream reply settles — audio seconds ×
+the transcription rate, or characters × the speech rate, using the rates
+active at billing time — and is the same value the console audit shows and
+that user consumption accounting uses. It is read from the ledger at query
+time, never recomputed.
 
 ## Notes
 
 - A request dropped by a saturated audit queue is neither billed nor queryable.
 - The single-record wait exists for interactive lookups; batch callers should
   rely on the `missing` list instead.
-

@@ -5,28 +5,28 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install --yes ca-certificates certbot curl nginx python3-certbot-nginx
 
-id deepseek-lb >/dev/null 2>&1 || useradd \
+id qwen-lb >/dev/null 2>&1 || useradd \
   --system \
-  --home-dir /var/lib/deepseek-lb \
+  --home-dir /var/lib/qwen-lb \
   --shell /usr/sbin/nologin \
-  deepseek-lb
+  qwen-lb
 
-install -d -m 0755 /opt/deepseek-lb/releases
-install -d -o deepseek-lb -g deepseek-lb -m 0700 /var/lib/deepseek-lb
+install -d -m 0755 /opt/qwen-lb/releases
+install -d -o qwen-lb -g qwen-lb -m 0700 /var/lib/qwen-lb
 
-install -m 0644 /dev/stdin /etc/systemd/system/deepseek-lb.service <<'UNIT'
+install -m 0644 /dev/stdin /etc/systemd/system/qwen-lb.service <<'UNIT'
 [Unit]
-Description=DeepSeek-LB
+Description=Qwen-LB
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=deepseek-lb
-Group=deepseek-lb
-Environment=HOME=/var/lib/deepseek-lb
-WorkingDirectory=/var/lib/deepseek-lb
-ExecStart=/opt/deepseek-lb/current/deepseek-lb
+User=qwen-lb
+Group=qwen-lb
+Environment=HOME=/var/lib/qwen-lb
+WorkingDirectory=/var/lib/qwen-lb
+ExecStart=/opt/qwen-lb/current/qwen-lb
 Restart=on-failure
 RestartSec=5s
 UMask=0077
@@ -39,17 +39,17 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadWritePaths=/var/lib/deepseek-lb
+ReadWritePaths=/var/lib/qwen-lb
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
-install -m 0644 /dev/stdin /etc/nginx/sites-available/deepseek-lb <<'NGINX'
+install -m 0644 /dev/stdin /etc/nginx/sites-available/qwen-lb <<'NGINX'
 server {
     listen 80;
     listen [::]:80;
-    server_name deepseek.ntnl.io;
+    server_name qwen.ntnl.io;
 
     client_max_body_size 512m;
 
@@ -67,9 +67,9 @@ server {
 }
 NGINX
 
-ln -sfn /etc/nginx/sites-available/deepseek-lb /etc/nginx/sites-enabled/deepseek-lb
+ln -sfn /etc/nginx/sites-available/qwen-lb /etc/nginx/sites-enabled/qwen-lb
 rm -f /etc/nginx/sites-enabled/default
 systemctl daemon-reload
-systemctl enable deepseek-lb.service
+systemctl enable qwen-lb.service
 nginx -t
 systemctl restart nginx

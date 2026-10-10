@@ -24,26 +24,25 @@ test("places provider audit behind the administrator navigation and route", () =
   assert.match(app, /providerAuditFailureRate/)
   assert.match(app, /providerAuditFailureRateChart/)
   assert.match(app, /providerAuditRequestCountChart/)
-  assert.match(app, /providerAuditInputTokensChart/)
+  assert.match(app, /providerAuditAudioSecondsChart/)
   assert.match(app, /provider-audit\?period=/)
   assert.match(app, /<TabsTrigger value="24h">/)
   assert.match(app, /dataKey="requests"/)
-  assert.match(app, /dataKey="input_tokens"/)
+  assert.match(app, /dataKey="audio_seconds"/)
 })
 
-test("exposes only the DeepSeek surface in the sidebar navigation", () => {
+test("exposes only the Qwen voice surface in the sidebar navigation", () => {
   const navigation = app.slice(
     app.indexOf("const navigationGroups"),
-    app.indexOf("function toggleLocale")
+    app.indexOf("const nav: AppNavGroup[]")
   )
+  assert.match(navigation, /\["direct-api-integration", BookOpenIcon\]/)
+  assert.match(navigation, /\["voice", AudioLinesIcon\]/)
+  assert.match(navigation, /\["voice-prices", TagsIcon\]/)
   assert.doesNotMatch(
     navigation,
-    /transcriptions|realtime|images|model-downgrade-audit/
+    /codex-integration|dsh-integration|opencode-integration|web-search|model-prices/
   )
-  assert.match(app, /\["codex-integration", PencilIcon\]/)
-  assert.match(app, /\["dsh-integration", KeyRoundIcon\]/)
-  assert.match(app, /\["opencode-integration", KeyRoundIcon\]/)
-  assert.match(app, /\["direct-api-integration", BookOpenIcon\]/)
 })
 
 test("keeps top-ups in the workspace navigation group", () => {
@@ -80,16 +79,17 @@ test("keeps consumer actions beside their identifying columns with rotation conf
   assert.doesNotMatch(consumers, /intercept_degradation/)
 })
 
-test("shows the billing window and token ratios in the account overview", () => {
+test("shows the voice totals in the account overview", () => {
   const dashboard = app.slice(
     app.indexOf("function Dashboard"),
-    app.indexOf("function ModelPricesPage")
+    app.indexOf("function VoicePricesPage")
   )
 
   assert.match(dashboard, /t\.accountOverview/)
-  assert.match(dashboard, /t\.pricingTariffTitle/)
-  assert.match(dashboard, /data\?\.peak_now \? t\.pricingPeak : t\.pricingOffPeak/)
-  assert.match(dashboard, /t\.cacheRate[\s\S]*cacheHitRate\(/)
-  assert.match(dashboard, /t\.inputOutputRatio[\s\S]*inputOutputRatio\(/)
-  assert.doesNotMatch(dashboard, /<CardTitle>\{t\.operationalStatus\}/)
+  assert.match(dashboard, /t\.audioSeconds24h[\s\S]*formatSeconds\(/)
+  assert.match(dashboard, /t\.characters24h/)
+  assert.match(dashboard, /t\.cost24h[\s\S]*formatUsd\(/)
+  assert.match(dashboard, /data\?\.transcription_model_ids/)
+  assert.match(dashboard, /data\?\.speech_model_ids/)
+  assert.doesNotMatch(dashboard, /peak_now|cacheHitRate/)
 })

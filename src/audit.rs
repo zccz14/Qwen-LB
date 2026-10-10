@@ -36,9 +36,6 @@ pub struct AuditEvent {
     pub method: String,
     pub path: String,
     pub model: Option<String>,
-    pub reasoning_effort: Option<String>,
-    /// Whether the request started inside DeepSeek peak hours.
-    pub peak: bool,
     pub status: i64,
     pub upstream_http_version: Option<String>,
     pub first_byte_latency_ms: Option<i64>,
@@ -51,12 +48,11 @@ pub struct AuditEvent {
     pub upstream_accept_encoding: Option<String>,
     pub upstream_content_encoding: Option<String>,
     pub latency_ms: i64,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cached_tokens: i64,
-    pub official_cost_usd_nanos: i64,
-    pub actual_cost_usd_nanos: i64,
-    pub price_multiplier_nanos: i64,
+    /// Audio seconds transcribed, as the upstream reported them.
+    pub audio_seconds: f64,
+    /// Characters synthesized, as the upstream reported them.
+    pub characters: i64,
+    pub cost_usd_nanos: i64,
     pub error: Option<String>,
     pub error_code: Option<String>,
     pub client_ip: String,
@@ -260,48 +256,30 @@ async fn insert(
     transaction: &mut Transaction<'_, Sqlite>,
     event: &AuditEvent,
 ) -> Result<(), sqlx::Error> {
-    let official_cost_usd_nanos = event.official_cost_usd_nanos.max(0);
-    let actual_cost_usd_nanos = event.actual_cost_usd_nanos.max(0);
-    let (official_consumed_usd_before_nanos, actual_consumed_usd_before_nanos): (i64, i64) =
-        sqlx::query_as(
-            "SELECT official_consumed_usd_nanos,consumed_usd_nanos FROM users WHERE id=?",
-        )
-        .bind(&event.user_id)
-        .fetch_one(&mut **transaction)
-        .await?;
-    let official_consumed_usd_after_nanos =
-        official_consumed_usd_before_nanos.saturating_add(official_cost_usd_nanos);
-    let actual_consumed_usd_after_nanos =
-        actual_consumed_usd_before_nanos.saturating_add(actual_cost_usd_nanos);
-    sqlx::query("UPDATE users SET official_consumed_usd_nanos=?,consumed_usd_nanos=? WHERE id=?")
-        .bind(official_consumed_usd_after_nanos)
-        .bind(actual_consumed_usd_after_nanos)
+    let cost_usd_nanos = event.cost_usd_nanos.max(0);
+    let consumed_usd_before_nanos: i64 =
+        sqlx::query_scalar("SELECT consumed_usd_nanos FROM users WHERE id=?")
+            .bind(&event.user_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+    let consumed_usd_after_nanos = consumed_usd_before_nanos.saturating_add(cost_usd_nanos);
+    sqlx::query("UPDATE users SET consumed_usd_nanos=? WHERE id=?")
+        .bind(consumed_usd_after_nanos)
         .bind(&event.user_id)
         .execute(&mut **transaction)
         .await?;
-    let (
-        official_provided_usd_before_nanos,
-        official_provided_usd_after_nanos,
-        actual_provided_usd_before_nanos,
-        actual_provided_usd_after_nanos,
-    ) = provider_provided_balances(
-        transaction,
-        event.provider_id.as_deref(),
-        official_cost_usd_nanos,
-        actual_cost_usd_nanos,
-    )
-    .await?;
+    let (provided_usd_before_nanos, provided_usd_after_nanos) =
+        provider_provided_balances(transaction, event.provider_id.as_deref(), cost_usd_nanos)
+            .await?;
 
     sqlx::query(
-        "INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,reasoning_effort,peak,status,first_byte_latency_ms,request_bytes,response_bytes,request_transport_bytes,response_transport_bytes,downstream_accept_encoding,downstream_content_encoding,upstream_accept_encoding,upstream_content_encoding,latency_ms,input_tokens,output_tokens,cached_tokens,official_cost_usd_nanos,actual_cost_usd_nanos,price_multiplier_nanos,official_consumed_usd_before_nanos,official_consumed_usd_after_nanos,actual_consumed_usd_before_nanos,actual_consumed_usd_after_nanos,official_provided_usd_before_nanos,official_provided_usd_after_nanos,actual_provided_usd_before_nanos,actual_provided_usd_after_nanos,error,client_ip,created_at,upstream_http_version,error_code) VALUES(
-            ?,?,?,?,?,?,
+        "INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,status,first_byte_latency_ms,request_bytes,response_bytes,request_transport_bytes,response_transport_bytes,downstream_accept_encoding,downstream_content_encoding,upstream_accept_encoding,upstream_content_encoding,latency_ms,audio_seconds,characters,cost_usd_nanos,consumed_usd_before_nanos,consumed_usd_after_nanos,provided_usd_before_nanos,provided_usd_after_nanos,error,client_ip,created_at,upstream_http_version,error_code) VALUES(
+            ?,?,?,?,?,
             (SELECT id FROM providers WHERE id=?),
             ?,?,?,?,?,?,?,
             ?,?,?,?,?,?,?,
             ?,?,?,?,?,?,?,
-            ?,?,?,?,?,?,?,
-            ?,?,?,?,?,?,?,
-            ?
+            ?,?,?,?,?,?,?
         )",
     )
         .bind(&event.id)
@@ -315,8 +293,6 @@ async fn insert(
         .bind(&event.method)
         .bind(&event.path)
         .bind(&event.model)
-        .bind(&event.reasoning_effort)
-        .bind(event.peak)
         .bind(event.status)
         .bind(event.first_byte_latency_ms)
         .bind(event.request_bytes)
@@ -328,20 +304,13 @@ async fn insert(
         .bind(&event.upstream_accept_encoding)
         .bind(&event.upstream_content_encoding)
         .bind(event.latency_ms)
-        .bind(event.input_tokens)
-        .bind(event.output_tokens)
-        .bind(event.cached_tokens)
-        .bind(official_cost_usd_nanos)
-        .bind(actual_cost_usd_nanos)
-        .bind(event.price_multiplier_nanos)
-        .bind(official_consumed_usd_before_nanos)
-        .bind(official_consumed_usd_after_nanos)
-        .bind(actual_consumed_usd_before_nanos)
-        .bind(actual_consumed_usd_after_nanos)
-        .bind(official_provided_usd_before_nanos)
-        .bind(official_provided_usd_after_nanos)
-        .bind(actual_provided_usd_before_nanos)
-        .bind(actual_provided_usd_after_nanos)
+        .bind(event.audio_seconds)
+        .bind(event.characters)
+        .bind(cost_usd_nanos)
+        .bind(consumed_usd_before_nanos)
+        .bind(consumed_usd_after_nanos)
+        .bind(provided_usd_before_nanos)
+        .bind(provided_usd_after_nanos)
         .bind(&event.error)
         .bind(&event.client_ip)
         .bind(event.created_at)
@@ -370,44 +339,39 @@ async fn insert(
 async fn provider_provided_balances(
     transaction: &mut Transaction<'_, Sqlite>,
     provider_id: Option<&str>,
-    official_cost_usd_nanos: i64,
-    actual_cost_usd_nanos: i64,
-) -> Result<(i64, i64, i64, i64), sqlx::Error> {
+    cost_usd_nanos: i64,
+) -> Result<(i64, i64), sqlx::Error> {
     let Some(provider_id) = provider_id else {
-        return Ok((0, 0, 0, 0));
+        return Ok((0, 0));
     };
-    let Some((owner_id, official_before, actual_before)) = sqlx::query_as::<_, (Option<String>, i64, i64)>(
-        "SELECT owner_id,official_provided_usd_nanos,actual_provided_usd_nanos FROM providers WHERE id=?",
+    let Some((owner_id, provided_before)) = sqlx::query_as::<_, (Option<String>, i64)>(
+        "SELECT owner_id,provided_usd_nanos FROM providers WHERE id=?",
     )
     .bind(provider_id)
     .fetch_optional(&mut **transaction)
     .await?
     else {
-        return Ok((0, 0, 0, 0));
+        return Ok((0, 0));
     };
-    let official_after = official_before.saturating_add(official_cost_usd_nanos);
-    let actual_after = actual_before.saturating_add(actual_cost_usd_nanos);
-    sqlx::query(
-        "UPDATE providers SET official_provided_usd_nanos=?,actual_provided_usd_nanos=? WHERE id=?",
-    )
-    .bind(official_after)
-    .bind(actual_after)
-    .bind(provider_id)
-    .execute(&mut **transaction)
-    .await?;
+    let provided_after = provided_before.saturating_add(cost_usd_nanos);
+    sqlx::query("UPDATE providers SET provided_usd_nanos=? WHERE id=?")
+        .bind(provided_after)
+        .bind(provider_id)
+        .execute(&mut **transaction)
+        .await?;
     if let Some(owner_id) = owner_id {
-        let provided_before: i64 =
+        let owner_before: i64 =
             sqlx::query_scalar("SELECT provided_usd_nanos FROM users WHERE id=?")
                 .bind(&owner_id)
                 .fetch_one(&mut **transaction)
                 .await?;
         sqlx::query("UPDATE users SET provided_usd_nanos=? WHERE id=?")
-            .bind(provided_before.saturating_add(actual_cost_usd_nanos))
+            .bind(owner_before.saturating_add(cost_usd_nanos))
             .bind(owner_id)
             .execute(&mut **transaction)
             .await?;
     }
-    Ok((official_before, official_after, actual_before, actual_after))
+    Ok((provided_before, provided_after))
 }
 
 async fn cleanup(pool: SqlitePool, config: Arc<ArcSwap<Config>>, write_gate: SqliteWriteGate) {
@@ -448,13 +412,7 @@ async fn delete_expired(
 mod tests {
     use super::*;
 
-    fn event(
-        id: &str,
-        user_id: &str,
-        consumer_id: &str,
-        official_cost_usd_nanos: i64,
-        actual_cost_usd_nanos: i64,
-    ) -> AuditEvent {
+    fn event(id: &str, user_id: &str, consumer_id: &str, cost_usd_nanos: i64) -> AuditEvent {
         AuditEvent {
             id: id.to_owned(),
             request_id: id.to_owned(),
@@ -466,10 +424,8 @@ mod tests {
             affinity_hash: None,
             affinity_source: None,
             method: "POST".to_owned(),
-            path: "/v1/chat/completions".to_owned(),
-            model: Some("deepseek-flash".to_owned()),
-            reasoning_effort: None,
-            peak: false,
+            path: "/v1/audio/transcriptions".to_owned(),
+            model: Some("qwen-audio-3.0-asr-flash".to_owned()),
             status: 200,
             upstream_http_version: None,
             first_byte_latency_ms: None,
@@ -482,12 +438,9 @@ mod tests {
             upstream_accept_encoding: None,
             upstream_content_encoding: None,
             latency_ms: 1,
-            input_tokens: 0,
-            output_tokens: 0,
-            cached_tokens: 0,
-            official_cost_usd_nanos,
-            actual_cost_usd_nanos,
-            price_multiplier_nanos: 100_000_000,
+            audio_seconds: 1.5,
+            characters: 0,
+            cost_usd_nanos,
             error: None,
             error_code: None,
             client_ip: "127.0.0.1".to_owned(),
@@ -514,49 +467,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_persists_the_peak_tariff_flag() {
-        let pool = crate::db::connect_memory().await.unwrap();
-        seed_user_and_consumer(&pool).await;
-        let mut transaction = pool.begin().await.unwrap();
-        let mut peak = event("peak", "user", "key", 10, 1);
-        peak.peak = true;
-        insert(&mut transaction, &peak).await.unwrap();
-        insert(&mut transaction, &event("off-peak", "user", "key", 10, 1))
-            .await
-            .unwrap();
-        transaction.commit().await.unwrap();
-
-        let rows: Vec<(String, i64)> = sqlx::query_as("SELECT id,peak FROM api_calls ORDER BY id")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            rows,
-            vec![("off-peak".to_owned(), 0), ("peak".to_owned(), 1)]
-        );
-    }
-
-    #[tokio::test]
     async fn audit_persists_nonnegative_user_consumption_and_per_call_balances() {
         let pool = crate::db::connect_memory().await.unwrap();
         seed_user_and_consumer(&pool).await;
         let mut transaction = pool.begin().await.unwrap();
-        insert(&mut transaction, &event("first", "user", "key", 125, 12))
+        insert(&mut transaction, &event("first", "user", "key", 12))
             .await
             .unwrap();
-        insert(&mut transaction, &event("second", "user", "key", 0, 0))
+        insert(&mut transaction, &event("second", "user", "key", 0))
             .await
             .unwrap();
-        insert(&mut transaction, &event("third", "user", "key", -10, -5))
+        insert(&mut transaction, &event("third", "user", "key", -5))
             .await
             .unwrap();
-        insert(&mut transaction, &event("fourth", "user", "key", 75, 7))
+        insert(&mut transaction, &event("fourth", "user", "key", 7))
             .await
             .unwrap();
         transaction.commit().await.unwrap();
 
-        let balances: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
-            "SELECT id,official_consumed_usd_before_nanos,official_consumed_usd_after_nanos,actual_consumed_usd_before_nanos,actual_consumed_usd_after_nanos FROM api_calls ORDER BY id",
+        let balances: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT id,consumed_usd_before_nanos,consumed_usd_after_nanos FROM api_calls ORDER BY id",
         )
         .fetch_all(&pool)
         .await
@@ -564,19 +494,18 @@ mod tests {
         assert_eq!(
             balances,
             vec![
-                ("first".to_owned(), 0, 125, 0, 12),
-                ("fourth".to_owned(), 125, 200, 12, 19),
-                ("second".to_owned(), 125, 125, 12, 12),
-                ("third".to_owned(), 125, 125, 12, 12),
+                ("first".to_owned(), 0, 12),
+                ("fourth".to_owned(), 12, 19),
+                ("second".to_owned(), 12, 12),
+                ("third".to_owned(), 12, 12),
             ]
         );
-        let consumed_usd_nanos: (i64, i64) = sqlx::query_as(
-            "SELECT official_consumed_usd_nanos,consumed_usd_nanos FROM users WHERE id='user'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(consumed_usd_nanos, (200, 19));
+        let consumed_usd_nanos: i64 =
+            sqlx::query_scalar("SELECT consumed_usd_nanos FROM users WHERE id='user'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(consumed_usd_nanos, 19);
     }
 
     #[tokio::test]
@@ -593,28 +522,20 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO providers(id,name,api_key,owner_id,created_at,updated_at) VALUES('provider','provider','sk-deepseek','owner',0,0)")
+        sqlx::query("INSERT INTO providers(id,name,api_key,owner_id,created_at,updated_at) VALUES('provider','provider','sk-qwen','owner',0,0)")
             .execute(&pool)
             .await
             .unwrap();
         let mut transaction = pool.begin().await.unwrap();
-        for (id, official_cost_usd_nanos, actual_cost_usd_nanos) in
-            [("first", 100, 12), ("second", 50, 7), ("third", -10, -5)]
-        {
-            let mut event = event(
-                id,
-                "caller",
-                "key",
-                official_cost_usd_nanos,
-                actual_cost_usd_nanos,
-            );
+        for (id, cost_usd_nanos) in [("first", 12_i64), ("second", 7), ("third", -5)] {
+            let mut event = event(id, "caller", "key", cost_usd_nanos);
             event.provider_id = Some("provider".to_owned());
             insert(&mut transaction, &event).await.unwrap();
         }
         transaction.commit().await.unwrap();
 
-        let balances: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
-            "SELECT id,official_provided_usd_before_nanos,official_provided_usd_after_nanos,actual_provided_usd_before_nanos,actual_provided_usd_after_nanos FROM api_calls ORDER BY id",
+        let balances: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT id,provided_usd_before_nanos,provided_usd_after_nanos FROM api_calls ORDER BY id",
         )
         .fetch_all(&pool)
         .await
@@ -622,30 +543,23 @@ mod tests {
         assert_eq!(
             balances,
             vec![
-                ("first".to_owned(), 0, 100, 0, 12),
-                ("second".to_owned(), 100, 150, 12, 19),
-                ("third".to_owned(), 150, 150, 19, 19),
+                ("first".to_owned(), 0, 12),
+                ("second".to_owned(), 12, 19),
+                ("third".to_owned(), 19, 19),
             ]
         );
-        let provider: (i64, i64) = sqlx::query_as(
-            "SELECT official_provided_usd_nanos,actual_provided_usd_nanos FROM providers WHERE id='provider'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(provider, (150, 19));
+        let provider_provided: i64 =
+            sqlx::query_scalar("SELECT provided_usd_nanos FROM providers WHERE id='provider'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(provider_provided, 19);
         let owner_provided: i64 =
             sqlx::query_scalar("SELECT provided_usd_nanos FROM users WHERE id='owner'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        let caller_provided: i64 =
-            sqlx::query_scalar("SELECT provided_usd_nanos FROM users WHERE id='caller'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
         assert_eq!(owner_provided, 19);
-        assert_eq!(caller_provided, 0);
     }
 
     #[tokio::test]
@@ -653,7 +567,7 @@ mod tests {
         let pool = crate::db::connect_memory().await.unwrap();
         seed_user_and_consumer(&pool).await;
         let write_gate = SqliteWriteGate::default();
-        let mut archived = event("archived", "user", "key", 0, 0);
+        let mut archived = event("archived", "user", "key", 0);
         archived.request_archive = true;
         archived.request_headers_json =
             r#"[["authorization","Bearer sk-secret"],["accept","*/*"]]"#.to_owned();
@@ -695,7 +609,7 @@ mod tests {
         let pool = crate::db::connect_memory().await.unwrap();
         seed_user_and_consumer(&pool).await;
         for (id, created_at) in [("expired", 0_i64), ("retained", 200_000_i64)] {
-            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,created_at) VALUES(?,?, 'key','user','POST','/v1/chat/completions',200,1,?)")
+            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,created_at) VALUES(?,?, 'key','user','POST','/v1/audio/transcriptions',200,1,?)")
                 .bind(id)
                 .bind(id)
                 .bind(created_at)
@@ -726,7 +640,7 @@ mod tests {
     #[tokio::test]
     async fn audit_and_provider_maintenance_share_the_write_gate() {
         let path = std::env::temp_dir().join(format!(
-            "deepseek-lb-audit-maintenance-{}.sqlite3",
+            "qwen-lb-audit-maintenance-{}.sqlite3",
             uuid::Uuid::new_v4()
         ));
         let pool = crate::db::connect_test_file(&path).await.unwrap();
@@ -734,7 +648,7 @@ mod tests {
 
         let write_gate = SqliteWriteGate::default();
         let batch = vec![QueuedAudit::Event {
-            event: Box::new(event("call", "user", "key", 1, 1)),
+            event: Box::new(event("call", "user", "key", 1)),
             _archive_budget: None,
         }];
         let balancer = crate::balancer::Balancer::default();

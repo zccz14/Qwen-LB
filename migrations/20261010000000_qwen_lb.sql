@@ -1,8 +1,12 @@
--- DeepSeek-LB consolidated schema.
+-- Qwen-LB consolidated schema.
 --
--- DeepSeek-LB starts from a clean slate: there is no deployed predecessor
--- database to upgrade, so the migration history is a single reviewed snapshot
--- instead of the long compatibility chain inherited from OpenAI-LB.
+-- Qwen-LB starts from a clean slate: there is no deployed predecessor database
+-- to upgrade, so the migration history is a single reviewed snapshot instead
+-- of a long compatibility chain.
+--
+-- Money is stored in USD nanodollars (1e-9 USD). The seeded model prices are
+-- converted from the Qwen platform's CNY list prices at a 7.2 exchange rate and
+-- are adjustable in the console.
 
 CREATE TABLE app_meta (
     key TEXT PRIMARY KEY,
@@ -14,14 +18,16 @@ INSERT INTO app_meta(key,value,updated_at) VALUES
     ('setup_complete','false',unixepoch()),
     ('auth_issuer','',unixepoch()),
     ('auth_audience','',unixepoch()),
-    ('upstream_base','https://api.deepseek.com',unixepoch()),
-    ('available_model_ids','["deepseek-flash","deepseek-v4-pro"]',unixepoch()),
+    ('upstream_base','https://maas.qianwenaiapi.com',unixepoch()),
+    ('transcription_models','[{"model":"qwen-audio-3.0-asr-flash","price_usd_nanos_per_second":30556}]',unixepoch()),
+    ('default_transcription_model','qwen-audio-3.0-asr-flash',unixepoch()),
+    ('speech_models','[{"model":"qwen3-tts-flash","price_usd_nanos_per_character":11111}]',unixepoch()),
+    ('default_speech_model','qwen3-tts-flash',unixepoch()),
     ('allow_all_users_debt','false',unixepoch()),
-    ('response_body_limit','2097152',unixepoch()),
+    ('response_body_limit','50331648',unixepoch()),
     ('affinity_ttl_seconds','86400',unixepoch()),
     ('provider_concurrency_limit','3',unixepoch()),
     ('request_archive_retention_days','7',unixepoch()),
-    ('model_price_multiplier_nanos','1000000000',unixepoch()),
     ('midas_api_base','https://midas.ntnl.io/api',unixepoch()),
     ('midas_fund_user_id','',unixepoch()),
     ('midas_fund_api_key','',unixepoch());
@@ -30,7 +36,6 @@ CREATE TABLE users (
     id TEXT PRIMARY KEY,
     role TEXT NOT NULL CHECK(role IN ('root','admin','user')),
     created_at INTEGER NOT NULL,
-    official_consumed_usd_nanos INTEGER NOT NULL DEFAULT 0 CHECK(official_consumed_usd_nanos >= 0),
     consumed_usd_nanos INTEGER NOT NULL DEFAULT 0 CHECK(consumed_usd_nanos >= 0),
     allow_debt INTEGER NOT NULL DEFAULT 0 CHECK(allow_debt IN (0,1)),
     provided_usd_nanos INTEGER NOT NULL DEFAULT 0 CHECK(provided_usd_nanos >= 0)
@@ -54,7 +59,7 @@ CREATE INDEX consumers_user_idx ON consumers(user_id, created_at DESC);
 CREATE INDEX consumers_visible_user_idx
 ON consumers(user_id,is_system,is_deleted,created_at DESC);
 
--- One DeepSeek provider is one API key: `name` plus `api_key`, nothing else.
+-- One Qwen provider is one API key: `name` plus `api_key`, nothing else.
 CREATE TABLE providers (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -69,8 +74,7 @@ CREATE TABLE providers (
     updated_at INTEGER NOT NULL,
     owner_id TEXT REFERENCES users(id) ON DELETE CASCADE,
     visibility TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('public','private')),
-    official_provided_usd_nanos INTEGER NOT NULL DEFAULT 0 CHECK(official_provided_usd_nanos >= 0),
-    actual_provided_usd_nanos INTEGER NOT NULL DEFAULT 0 CHECK(actual_provided_usd_nanos >= 0),
+    provided_usd_nanos INTEGER NOT NULL DEFAULT 0 CHECK(provided_usd_nanos >= 0),
     is_deleted INTEGER NOT NULL DEFAULT 0 CHECK(is_deleted IN (0,1))
 );
 CREATE INDEX providers_available_idx ON providers(manual_disabled, status, cooldown_until);
@@ -100,15 +104,13 @@ CREATE TABLE api_calls (
     method TEXT NOT NULL,
     path TEXT NOT NULL,
     model TEXT,
-    reasoning_effort TEXT,
-    -- 1 when the request started inside DeepSeek peak hours, 0 for off-peak.
-    peak INTEGER NOT NULL DEFAULT 0 CHECK(peak IN (0,1)),
     status INTEGER NOT NULL,
     first_byte_latency_ms INTEGER,
     latency_ms INTEGER NOT NULL,
-    input_tokens INTEGER NOT NULL DEFAULT 0,
-    output_tokens INTEGER NOT NULL DEFAULT 0,
-    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    -- Audio transcribed, in seconds, as the upstream reported it.
+    audio_seconds REAL NOT NULL DEFAULT 0 CHECK(audio_seconds >= 0),
+    -- Characters synthesized, as the upstream reported them.
+    characters INTEGER NOT NULL DEFAULT 0 CHECK(characters >= 0),
     request_bytes INTEGER NOT NULL DEFAULT 0,
     response_bytes INTEGER NOT NULL DEFAULT 0,
     request_transport_bytes INTEGER NOT NULL DEFAULT 0,
@@ -118,17 +120,11 @@ CREATE TABLE api_calls (
     upstream_accept_encoding TEXT,
     upstream_content_encoding TEXT,
     upstream_http_version TEXT,
-    official_cost_usd_nanos INTEGER NOT NULL DEFAULT 0 CHECK(official_cost_usd_nanos >= 0),
-    actual_cost_usd_nanos INTEGER NOT NULL DEFAULT 0 CHECK(actual_cost_usd_nanos >= 0),
-    price_multiplier_nanos INTEGER NOT NULL DEFAULT 1000000000 CHECK(price_multiplier_nanos > 0),
-    official_consumed_usd_before_nanos INTEGER NOT NULL DEFAULT 0 CHECK(official_consumed_usd_before_nanos >= 0),
-    official_consumed_usd_after_nanos INTEGER NOT NULL DEFAULT 0 CHECK(official_consumed_usd_after_nanos >= official_consumed_usd_before_nanos),
-    actual_consumed_usd_before_nanos INTEGER NOT NULL DEFAULT 0 CHECK(actual_consumed_usd_before_nanos >= 0),
-    actual_consumed_usd_after_nanos INTEGER NOT NULL DEFAULT 0 CHECK(actual_consumed_usd_after_nanos >= actual_consumed_usd_before_nanos),
-    official_provided_usd_before_nanos INTEGER NOT NULL DEFAULT 0 CHECK(official_provided_usd_before_nanos >= 0),
-    official_provided_usd_after_nanos INTEGER NOT NULL DEFAULT 0 CHECK(official_provided_usd_after_nanos >= official_provided_usd_before_nanos),
-    actual_provided_usd_before_nanos INTEGER NOT NULL DEFAULT 0 CHECK(actual_provided_usd_before_nanos >= 0),
-    actual_provided_usd_after_nanos INTEGER NOT NULL DEFAULT 0 CHECK(actual_provided_usd_after_nanos >= actual_provided_usd_before_nanos),
+    cost_usd_nanos INTEGER NOT NULL DEFAULT 0 CHECK(cost_usd_nanos >= 0),
+    consumed_usd_before_nanos INTEGER NOT NULL DEFAULT 0 CHECK(consumed_usd_before_nanos >= 0),
+    consumed_usd_after_nanos INTEGER NOT NULL DEFAULT 0 CHECK(consumed_usd_after_nanos >= consumed_usd_before_nanos),
+    provided_usd_before_nanos INTEGER NOT NULL DEFAULT 0 CHECK(provided_usd_before_nanos >= 0),
+    provided_usd_after_nanos INTEGER NOT NULL DEFAULT 0 CHECK(provided_usd_after_nanos >= provided_usd_before_nanos),
     error TEXT,
     error_code TEXT,
     client_ip TEXT,
@@ -141,6 +137,12 @@ CREATE INDEX api_calls_created_at_idx ON api_calls(created_at DESC);
 CREATE INDEX api_calls_thread_time_idx ON api_calls(thread_id, created_at DESC);
 CREATE INDEX api_calls_error_code_time_idx ON api_calls(error_code, created_at DESC)
 WHERE error_code IS NOT NULL;
+-- The cost query API resolves records by the unified request ID: the value of
+-- the inbound `x-normai-request-id` header when a gateway supplies one,
+-- otherwise a generated UUID. Duplicate rows for one ID are legitimate (a
+-- transport-level re-send can arrive twice), and audit writes must never fail
+-- on a collision, so the index is not unique.
+CREATE INDEX api_calls_request_id_idx ON api_calls(request_id);
 
 CREATE TABLE request_archives (
     api_call_id TEXT PRIMARY KEY REFERENCES api_calls(id) ON DELETE CASCADE,

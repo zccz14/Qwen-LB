@@ -85,7 +85,7 @@ impl AuthManager {
             .read()
             .await
             .clone()
-            .ok_or_else(|| AppError::unavailable("DeepSeek-LB setup is not complete"))
+            .ok_or_else(|| AppError::unavailable("Qwen-LB setup is not complete"))
     }
 }
 
@@ -266,7 +266,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let issuer = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, jwks).await.unwrap() });
-        let layer = create_layer(&issuer, "deepseek-lb.test".to_owned())
+        let layer = create_layer(&issuer, "qwen-lb.test".to_owned())
             .await
             .unwrap();
         assert!(
@@ -275,7 +275,7 @@ mod tests {
                 .verify(&browser_token(
                     &signing,
                     &issuer,
-                    serde_json::json!(["deepseek-lb.test", "linkit.ntnl.io"])
+                    serde_json::json!(["qwen-lb.test", "linkit.ntnl.io"])
                 ))
                 .await
                 .is_ok()
@@ -316,7 +316,7 @@ mod tests {
         let state = crate::test_state("http://token.invalid").await;
         state
             .auth
-            .configure(issuer, "deepseek-lb.test".to_owned())
+            .configure(issuer, "qwen-lb.test".to_owned())
             .await
             .unwrap();
         let response = crate::router(state)

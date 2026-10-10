@@ -1,21 +1,15 @@
-# React + TypeScript + Vite + shadcn/ui
+# Qwen-LB web console
 
-This is a template for a new Vite project with React, TypeScript, and shadcn/ui.
+React + TypeScript + Vite + shadcn/ui console for the Qwen-LB voice API load
+balancer. It is embedded into the single Rust binary via `rust-embed` and served
+from `/`; the API it talks to lives under `/api` and `/v1`.
 
-## Adding components
+- `npm ci && npm run dev` — local dev with Vite proxying `/api` and `/v1` to
+  `http://127.0.0.1:8080` (run `cargo run` for the backend).
+- `npm run check` — the full gate: unit tests, typecheck, ESLint, production
+  build, and the built-CSS layout checks.
+- `npm run build` — typecheck + production bundle into `web/dist`, which the
+  Rust build embeds. Build this before `cargo build`.
 
-To add components to your app, run the following command:
-
-```bash
-npx shadcn@latest add button
-```
-
-This will place the ui components in the `src/components` directory.
-
-## Using components
-
-To use the components in your app, import them as follows:
-
-```tsx
-import { Button } from "@/components/ui/button"
-```
+Design language and product context live in the repository's `PRODUCT.md` and
+`DESIGN.md`.
