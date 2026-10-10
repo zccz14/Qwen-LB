@@ -1,5 +1,5 @@
 use anyhow::Result;
-use deepseek_lb::{
+use qwen_lb::{
     AppState,
     config::{BootstrapConfig, Config},
     db, router,
@@ -11,7 +11,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("deepseek_lb=info,tower_http=info")),
+                .unwrap_or_else(|_| EnvFilter::new("qwen_lb=info,tower_http=info")),
         )
         .init();
     let bootstrap = BootstrapConfig::load()?;
@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
     let state = AppState::new(config, pool).await?;
     state.start_background_tasks();
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!(%listen, "DeepSeek-LB listening");
+    tracing::info!(%listen, "Qwen-LB listening");
     axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),

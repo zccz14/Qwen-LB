@@ -81,7 +81,7 @@ mod tests {
     #[tokio::test]
     async fn every_pooled_connection_has_required_pragmas() {
         let path =
-            std::env::temp_dir().join(format!("deepseek-lb-db-{}.sqlite3", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("qwen-lb-db-{}.sqlite3", uuid::Uuid::new_v4()));
         let pool = connect_test_file(&path).await.unwrap();
         let mut connections = Vec::new();
         for _ in 0..4 {
@@ -104,7 +104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_create_the_deepseek_lb_schema_with_seeded_settings() {
+    async fn migrations_create_the_qwen_lb_schema_with_seeded_settings() {
         let pool = connect_memory().await.unwrap();
         for table in [
             "app_meta",
@@ -129,19 +129,19 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(upstream_base, "https://api.deepseek.com");
+        assert_eq!(upstream_base, "https://maas.qianwenaiapi.com");
         let models: String =
-            sqlx::query_scalar("SELECT value FROM app_meta WHERE key='available_model_ids'")
+            sqlx::query_scalar("SELECT value FROM app_meta WHERE key='transcription_models'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(models, r#"["deepseek-flash","deepseek-v4-pro"]"#);
-        let body_limit: String =
-            sqlx::query_scalar("SELECT value FROM app_meta WHERE key='response_body_limit'")
+        assert!(models.contains("qwen-audio-3.0-asr-flash"));
+        let speech: String =
+            sqlx::query_scalar("SELECT value FROM app_meta WHERE key='speech_models'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(body_limit, "50331648");
+        assert!(speech.contains("qwen3-tts-flash"));
         // A provider is one API key and nothing else.
         let columns: Vec<String> = sqlx::query("SELECT name FROM pragma_table_info('providers')")
             .fetch_all(&pool)
@@ -151,7 +151,7 @@ mod tests {
             .map(|row| row.get(0))
             .collect();
         assert!(columns.contains(&"api_key".to_owned()));
-        for removed in ["access_token", "refresh_token", "account_id", "originator"] {
+        for removed in ["access_token", "refresh_token", "originator"] {
             assert!(
                 !columns.contains(&removed.to_owned()),
                 "providers still has {removed}"
@@ -174,7 +174,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_calls_record_the_peak_tariff() {
+    async fn api_calls_record_audio_seconds_and_cost() {
         let pool = connect_memory().await.unwrap();
         sqlx::query("INSERT INTO users(id,role,created_at) VALUES('user','user',0)")
             .execute(&pool)
@@ -184,14 +184,16 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,peak,created_at) VALUES('call','request','consumer','user','POST','/v1/chat/completions',200,1,1,1)")
+        sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,audio_seconds,cost_usd_nanos,created_at) VALUES('call','request','consumer','user','POST','/v1/audio/transcriptions',200,1,2.5,76390,0)")
             .execute(&pool)
             .await
             .unwrap();
-        let peak: i64 = sqlx::query_scalar("SELECT peak FROM api_calls WHERE id='call'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(peak, 1);
+        let (seconds, cost): (f64, i64) =
+            sqlx::query_as("SELECT audio_seconds,cost_usd_nanos FROM api_calls WHERE id='call'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(seconds, 2.5);
+        assert_eq!(cost, 76390);
     }
 }

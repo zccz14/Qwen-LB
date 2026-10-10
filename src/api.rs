@@ -18,12 +18,11 @@ use crate::{
     balancer::{self, Provider},
     config,
     crypto::consumer_secret_hash,
-    midas, payments, pricing,
+    midas, payments,
     resources::SystemResourcesSnapshot,
 };
 
 const PROVIDER_TEST_TIMEOUT: Duration = Duration::from_secs(30);
-const PROVIDER_AUXILIARY_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub async fn public_config(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let setup_required = setup_required(&state).await?;
@@ -43,8 +42,8 @@ pub async fn payment_summary(
     State(state): State<AppState>,
     Extension(user): Extension<UserIdentity>,
 ) -> Result<Json<Value>, AppError> {
-    let (official_consumed_usd_nanos, consumed_usd_nanos, provided_usd_nanos, allow_debt): (i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT official_consumed_usd_nanos,consumed_usd_nanos,provided_usd_nanos,allow_debt FROM users WHERE id=?",
+    let (consumed_usd_nanos, provided_usd_nanos, allow_debt): (i64, i64, i64) = sqlx::query_as(
+        "SELECT consumed_usd_nanos,provided_usd_nanos,allow_debt FROM users WHERE id=?",
     )
     .bind(&user.id)
     .fetch_one(&state.db)
@@ -61,7 +60,6 @@ pub async fn payment_summary(
     Ok(Json(json!({
         "topup_usd_nanos": topup_usd_nanos,
         "available_usd_nanos": topup_usd_nanos.saturating_add(provided_usd_nanos).saturating_sub(consumed_usd_nanos),
-        "official_consumed_usd_nanos": official_consumed_usd_nanos,
         "consumed_usd_nanos": consumed_usd_nanos,
         "provided_usd_nanos": provided_usd_nanos,
         "enforcement_enabled": allow_debt == 0 && !config.allow_all_users_debt,
@@ -70,13 +68,20 @@ pub async fn payment_summary(
     })))
 }
 
-pub async fn model_prices(State(state): State<AppState>) -> Json<Value> {
+/// The voice price table the console renders: per-second transcription rates
+/// and per-character speech rates, formatted as exact USD strings.
+pub async fn audio_prices(State(state): State<AppState>) -> Json<Value> {
     let config = state.config.load();
     Json(json!({
-        "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
-        "source_as_of": "2026-09-20",
-        "unit": "USD per 1M tokens",
-        "rows": pricing::official_model_prices(&config.available_model_ids)
+        "unit": "USD per second / USD per character",
+        "transcription": config.transcription_models.iter().map(|item| json!({
+            "model": item.model,
+            "price_usd_per_second": payments::format_usd_nanos(item.price_usd_nanos_per_second),
+        })).collect::<Vec<_>>(),
+        "speech": config.speech_models.iter().map(|item| json!({
+            "model": item.model,
+            "price_usd_per_character": payments::format_usd_nanos(item.price_usd_nanos_per_character),
+        })).collect::<Vec<_>>(),
     }))
 }
 
@@ -490,11 +495,9 @@ pub async fn list_providers(
 struct ProviderUsage {
     requests: i64,
     errors: i64,
-    peak_requests: i64,
-    input_tokens: i64,
-    output_tokens: i64,
-    cached_tokens: i64,
-    actual_cost_usd_nanos: i64,
+    audio_seconds: f64,
+    characters: i64,
+    cost_usd_nanos: i64,
 }
 
 enum ProviderUsageScope<'a> {
@@ -507,7 +510,7 @@ async fn provider_usage(
     scope: ProviderUsageScope<'_>,
 ) -> Result<HashMap<String, ProviderUsage>, AppError> {
     let since = chrono::Utc::now().timestamp() - 7 * 24 * 60 * 60;
-    let sql = "SELECT c.provider_id,COUNT(*),COALESCE(SUM(CASE WHEN c.error IS NOT NULL OR c.error_code IS NOT NULL OR c.status>=400 THEN 1 ELSE 0 END),0),COALESCE(SUM(c.peak),0),COALESCE(SUM(c.input_tokens),0),COALESCE(SUM(c.output_tokens),0),COALESCE(SUM(c.cached_tokens),0),COALESCE(SUM(c.actual_cost_usd_nanos),0) FROM api_calls c JOIN providers p ON p.id=c.provider_id WHERE c.provider_id IS NOT NULL AND c.created_at>=?";
+    let sql = "SELECT c.provider_id,COUNT(*),COALESCE(SUM(CASE WHEN c.error IS NOT NULL OR c.error_code IS NOT NULL OR c.status>=400 THEN 1 ELSE 0 END),0),COALESCE(SUM(c.audio_seconds),0),COALESCE(SUM(c.characters),0),COALESCE(SUM(c.cost_usd_nanos),0) FROM api_calls c JOIN providers p ON p.id=c.provider_id WHERE c.provider_id IS NOT NULL AND c.created_at>=?";
     let rows = match scope {
         ProviderUsageScope::All => {
             sqlx::query(&format!("{sql} GROUP BY c.provider_id"))
@@ -531,11 +534,9 @@ async fn provider_usage(
                 ProviderUsage {
                     requests: row.get(1),
                     errors: row.get(2),
-                    peak_requests: row.get(3),
-                    input_tokens: row.get(4),
-                    output_tokens: row.get(5),
-                    cached_tokens: row.get(6),
-                    actual_cost_usd_nanos: row.get(7),
+                    audio_seconds: row.get(3),
+                    characters: row.get(4),
+                    cost_usd_nanos: row.get(5),
                 },
             )
         })
@@ -830,6 +831,9 @@ pub async fn delete_provider(
     result
 }
 
+/// Tests one provider against the platform's OpenAI-compatible model catalog:
+/// a 200 with the catalog proves the key and the upstream base URL both work,
+/// and the answer reports whether the default voice models are visible.
 pub async fn test_provider(
     State(state): State<AppState>,
     Extension(user): Extension<UserIdentity>,
@@ -843,23 +847,14 @@ pub async fn test_provider(
             .await?
             .ok_or_else(|| AppError::not_found("provider not found"))?;
     let config = state.config.load_full();
-    let model = config
-        .available_model_ids
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "deepseek-flash".to_owned());
-    let payload = json!({
-        "model": model,
-        "messages": [{"role":"user","content":"ping"}],
-        "max_tokens": 1,
-        "stream": false
-    });
     let started = std::time::Instant::now();
     let response = state
         .client
-        .post(format!("{}/chat/completions", config.upstream_base))
+        .get(format!(
+            "{}/compatible-mode/v1/models",
+            config.upstream_base
+        ))
         .header("authorization", format!("Bearer {}", row.1))
-        .json(&payload)
         .timeout(PROVIDER_TEST_TIMEOUT)
         .send()
         .await;
@@ -868,11 +863,20 @@ pub async fn test_provider(
         Ok(response) => {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
+            let ids = model_ids_from_catalog(&body);
+            let has_transcription_model = ids
+                .iter()
+                .any(|model| model == &config.default_transcription_model);
+            let has_speech_model = ids
+                .iter()
+                .any(|model| model == &config.default_speech_model);
             json!({
                 "ok": status < 400,
                 "status": status,
                 "latency_ms": latency_ms,
-                "model": model,
+                "model_count": ids.len(),
+                "has_default_transcription_model": has_transcription_model,
+                "has_default_speech_model": has_speech_model,
                 "error": (status >= 400).then(|| provider_error_message(&body)),
             })
         }
@@ -880,51 +884,28 @@ pub async fn test_provider(
             "ok": false,
             "status": Value::Null,
             "latency_ms": latency_ms,
-            "model": model,
+            "model_count": 0,
+            "has_default_transcription_model": false,
+            "has_default_speech_model": false,
             "error": Some(error.to_string()),
         }),
     };
     Ok(Json(value))
 }
 
-pub async fn provider_balance(
-    State(state): State<AppState>,
-    Extension(user): Extension<UserIdentity>,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, AppError> {
-    require_provider_manager(&state, &user, &id).await?;
-    let api_key: String =
-        sqlx::query_scalar("SELECT api_key FROM providers WHERE id=? AND is_deleted=0")
-            .bind(&id)
-            .fetch_optional(&state.db)
-            .await?
-            .ok_or_else(|| AppError::not_found("provider not found"))?;
-    let config = state.config.load_full();
-    let response = state
-        .client
-        .get(format!("{}/user/balance", config.upstream_base))
-        .header("authorization", format!("Bearer {api_key}"))
-        .timeout(PROVIDER_AUXILIARY_TIMEOUT)
-        .send()
-        .await
-        .map_err(|error| {
-            AppError::upstream(502, format!("DeepSeek balance request failed: {error}"))
-        })?;
-    let status = response.status();
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|_| AppError::upstream(502, "DeepSeek returned invalid balance JSON"))?;
-    if !status.is_success() {
-        return Err(AppError::upstream(
-            status.as_u16(),
-            provider_error_message(&body.to_string()),
-        ));
-    }
-    Ok(Json(json!({
-        "is_available": body.get("is_available"),
-        "balance_infos": body.get("balance_infos"),
-    })))
+fn model_ids_from_catalog(body: &str) -> Vec<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value.get("data").and_then(Value::as_array).map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("id").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
 
 fn provider_error_message(body: &str) -> String {
@@ -934,6 +915,7 @@ fn provider_error_message(body: &str) -> String {
             value
                 .pointer("/error/message")
                 .and_then(Value::as_str)
+                .or_else(|| value.get("message").and_then(Value::as_str))
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| body.chars().take(400).collect())
@@ -1015,7 +997,7 @@ async fn usage_rows(
     user: &crate::auth::UserIdentity,
     since: i64,
 ) -> Result<Vec<Value>, AppError> {
-    let sql = "SELECT c.user_id,k.id,k.name,k.prefix,COALESCE(NULLIF(c.model,''),'unknown'),date(c.created_at,'unixepoch'),COUNT(c.id),COALESCE(SUM(c.input_tokens),0),COALESCE(SUM(c.cached_tokens),0),COALESCE(SUM(c.output_tokens),0),COALESCE(SUM(c.request_transport_bytes+c.response_transport_bytes),0),COALESCE(SUM(c.official_cost_usd_nanos),0),COALESCE(SUM(c.actual_cost_usd_nanos),0),COALESCE(SUM(c.peak),0) FROM api_calls c JOIN consumers k ON k.id=c.consumer_id WHERE c.created_at>=?";
+    let sql = "SELECT c.user_id,k.id,k.name,k.prefix,COALESCE(NULLIF(c.model,''),'unknown'),date(c.created_at,'unixepoch'),COUNT(c.id),COALESCE(SUM(c.audio_seconds),0),COALESCE(SUM(c.characters),0),COALESCE(SUM(c.request_transport_bytes+c.response_transport_bytes),0),COALESCE(SUM(c.cost_usd_nanos),0) FROM api_calls c JOIN consumers k ON k.id=c.consumer_id WHERE c.created_at>=?";
     let group = " GROUP BY c.user_id,k.id,k.name,k.prefix,COALESCE(NULLIF(c.model,''),'unknown'),date(c.created_at,'unixepoch') ORDER BY date(c.created_at,'unixepoch') ASC";
     let rows = if is_admin(user) {
         sqlx::query(&format!("{sql}{group}"))
@@ -1030,7 +1012,7 @@ async fn usage_rows(
             .await?
     };
     Ok(rows.into_iter().map(|row| {
-        json!({"user_id":row.get::<String,_>(0),"consumer_id":row.get::<String,_>(1),"consumer_name":row.get::<String,_>(2),"consumer_prefix":row.get::<String,_>(3),"model":row.get::<String,_>(4),"date":row.get::<String,_>(5),"requests":row.get::<i64,_>(6),"input_tokens":row.get::<i64,_>(7),"cached_tokens":row.get::<i64,_>(8),"output_tokens":row.get::<i64,_>(9),"network_transport_bytes":row.get::<i64,_>(10),"official_cost_usd_nanos":row.get::<i64,_>(11),"actual_cost_usd_nanos":row.get::<i64,_>(12),"peak_requests":row.get::<i64,_>(13)})
+        json!({"user_id":row.get::<String,_>(0),"consumer_id":row.get::<String,_>(1),"consumer_name":row.get::<String,_>(2),"consumer_prefix":row.get::<String,_>(3),"model":row.get::<String,_>(4),"date":row.get::<String,_>(5),"requests":row.get::<i64,_>(6),"audio_seconds":row.get::<f64,_>(7),"characters":row.get::<i64,_>(8),"network_transport_bytes":row.get::<i64,_>(9),"cost_usd_nanos":row.get::<i64,_>(10)})
     }).collect())
 }
 
@@ -1052,7 +1034,7 @@ pub async fn audit(
         .await?;
 
     let mut rows_query = QueryBuilder::<Sqlite>::new(
-        "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,p.name,c.path,c.method,c.model,c.reasoning_effort,c.peak,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.official_cost_usd_nanos,c.actual_cost_usd_nanos,c.price_multiplier_nanos,c.official_consumed_usd_before_nanos,c.official_consumed_usd_after_nanos,c.actual_consumed_usd_before_nanos,c.actual_consumed_usd_after_nanos,c.official_provided_usd_before_nanos,c.official_provided_usd_after_nanos,c.actual_provided_usd_before_nanos,c.actual_provided_usd_after_nanos,c.error_code FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers p ON p.id=c.provider_id",
+        "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,p.name,c.path,c.method,c.model,c.status,c.latency_ms,c.audio_seconds,c.characters,c.error,c.client_ip,c.created_at,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.cost_usd_nanos,c.consumed_usd_before_nanos,c.consumed_usd_after_nanos,c.provided_usd_before_nanos,c.provided_usd_after_nanos,c.error_code FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers p ON p.id=c.provider_id",
     );
     append_audit_filters(&mut rows_query, &filters, &user);
     rows_query
@@ -1073,33 +1055,24 @@ pub async fn audit(
             "path":row.get::<String,_>(7),
             "method":row.get::<String,_>(8),
             "model":row.get::<Option<String>,_>(9),
-            "reasoning_effort":row.get::<Option<String>,_>(10),
-            "peak":row.get::<i64,_>(11) != 0,
-            "status":row.get::<i64,_>(12),
-            "latency_ms":row.get::<i64,_>(13),
-            "input_tokens":row.get::<i64,_>(14),
-            "output_tokens":row.get::<i64,_>(15),
-            "cached_tokens":row.get::<i64,_>(16),
-            "error":row.get::<Option<String>,_>(17),
-            "client_ip":row.get::<Option<String>,_>(18),
-            "created_at":row.get::<i64,_>(19),
-            "first_byte_latency_ms":row.get::<Option<i64>,_>(20),
-            "request_bytes":row.get::<i64,_>(21),
-            "response_bytes":row.get::<i64,_>(22),
-            "request_transport_bytes":row.get::<i64,_>(23),
-            "response_transport_bytes":row.get::<i64,_>(24),
-            "official_cost_usd_nanos":row.get::<i64,_>(25),
-            "actual_cost_usd_nanos":row.get::<i64,_>(26),
-            "price_multiplier_nanos":row.get::<i64,_>(27),
-            "official_consumed_usd_before_nanos":row.get::<i64,_>(28),
-            "official_consumed_usd_after_nanos":row.get::<i64,_>(29),
-            "actual_consumed_usd_before_nanos":row.get::<i64,_>(30),
-            "actual_consumed_usd_after_nanos":row.get::<i64,_>(31),
-            "official_provided_usd_before_nanos":row.get::<i64,_>(32),
-            "official_provided_usd_after_nanos":row.get::<i64,_>(33),
-            "actual_provided_usd_before_nanos":row.get::<i64,_>(34),
-            "actual_provided_usd_after_nanos":row.get::<i64,_>(35),
-            "error_code":row.get::<Option<String>,_>(36)
+            "status":row.get::<i64,_>(10),
+            "latency_ms":row.get::<i64,_>(11),
+            "audio_seconds":row.get::<f64,_>(12),
+            "characters":row.get::<i64,_>(13),
+            "error":row.get::<Option<String>,_>(14),
+            "client_ip":row.get::<Option<String>,_>(15),
+            "created_at":row.get::<i64,_>(16),
+            "first_byte_latency_ms":row.get::<Option<i64>,_>(17),
+            "request_bytes":row.get::<i64,_>(18),
+            "response_bytes":row.get::<i64,_>(19),
+            "request_transport_bytes":row.get::<i64,_>(20),
+            "response_transport_bytes":row.get::<i64,_>(21),
+            "cost_usd_nanos":row.get::<i64,_>(22),
+            "consumed_usd_before_nanos":row.get::<i64,_>(23),
+            "consumed_usd_after_nanos":row.get::<i64,_>(24),
+            "provided_usd_before_nanos":row.get::<i64,_>(25),
+            "provided_usd_after_nanos":row.get::<i64,_>(26),
+            "error_code":row.get::<Option<String>,_>(27)
         })
     }).collect::<Vec<_>>(),"total":total})))
 }
@@ -1196,7 +1169,7 @@ pub async fn audit_detail(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let admin = is_admin(&user);
-    let columns = "c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,p.name,c.method,c.path,c.model,c.reasoning_effort,c.peak,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.downstream_accept_encoding,c.downstream_content_encoding,c.upstream_accept_encoding,c.upstream_content_encoding,a.upstream_request_headers_json,a.downstream_response_headers_json,c.upstream_http_version,c.official_cost_usd_nanos,c.actual_cost_usd_nanos,c.price_multiplier_nanos,c.official_consumed_usd_before_nanos,c.official_consumed_usd_after_nanos,c.actual_consumed_usd_before_nanos,c.actual_consumed_usd_after_nanos,c.official_provided_usd_before_nanos,c.official_provided_usd_after_nanos,c.actual_provided_usd_before_nanos,c.actual_provided_usd_after_nanos,COALESCE(a.bodies_deleted,0),c.error_code";
+    let columns = "c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,p.name,c.method,c.path,c.model,c.status,c.latency_ms,c.audio_seconds,c.characters,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.downstream_accept_encoding,c.downstream_content_encoding,c.upstream_accept_encoding,c.upstream_content_encoding,a.upstream_request_headers_json,a.downstream_response_headers_json,c.upstream_http_version,c.cost_usd_nanos,c.consumed_usd_before_nanos,c.consumed_usd_after_nanos,c.provided_usd_before_nanos,c.provided_usd_after_nanos,COALESCE(a.bodies_deleted,0),c.error_code";
     let from = " FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers p ON p.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?";
     let (sql, scope) = if admin {
         (format!("SELECT {columns}{from}"), None)
@@ -1215,7 +1188,7 @@ pub async fn audit_detail(
         .await?
         .ok_or_else(|| AppError::not_found("audit event not found"))?;
     let thread_id = row.get::<Option<String>, _>(2);
-    let consumer_id = row.get::<String, _>(29);
+    let consumer_id = row.get::<String, _>(26);
     let navigation_rows = if let Some(thread_id) = &thread_id {
         let (sql, scope) = if admin {
             (
@@ -1252,13 +1225,13 @@ pub async fn audit_detail(
         .and_then(|index| index.checked_sub(1))
         .and_then(|index| navigation_rows.get(index));
     let next = position.and_then(|index| navigation_rows.get(index + 1));
-    let request_headers = visible_archive_headers(row.get::<Option<String>, _>(23), admin);
-    let upstream_request_headers = visible_archive_headers(row.get::<Option<String>, _>(39), admin);
-    let response_headers = visible_archive_headers(row.get::<Option<String>, _>(26), admin);
+    let request_headers = visible_archive_headers(row.get::<Option<String>, _>(20), admin);
+    let upstream_request_headers = visible_archive_headers(row.get::<Option<String>, _>(36), admin);
+    let response_headers = visible_archive_headers(row.get::<Option<String>, _>(23), admin);
     let downstream_response_headers =
-        visible_archive_headers(row.get::<Option<String>, _>(40), admin);
-    let archive_available = row.get::<Option<String>, _>(22).is_some();
-    let bodies_available = archive_available && row.get::<i64, _>(53) == 0;
+        visible_archive_headers(row.get::<Option<String>, _>(37), admin);
+    let archive_available = row.get::<Option<String>, _>(19).is_some();
+    let bodies_available = archive_available && row.get::<i64, _>(44) == 0;
     let mut detail = json!({
         "id":row.get::<String,_>(0),
         "request_id":row.get::<String,_>(1),
@@ -1270,52 +1243,43 @@ pub async fn audit_detail(
         "method":row.get::<String,_>(7),
         "path":row.get::<String,_>(8),
         "model":row.get::<Option<String>,_>(9),
-        "reasoning_effort":row.get::<Option<String>,_>(10),
-        "peak":row.get::<i64,_>(11) != 0,
-        "status":row.get::<i64,_>(12),
-        "latency_ms":row.get::<i64,_>(13),
-        "input_tokens":row.get::<i64,_>(14),
-        "output_tokens":row.get::<i64,_>(15),
-        "cached_tokens":row.get::<i64,_>(16),
-        "error":row.get::<Option<String>,_>(17),
-        "client_ip":row.get::<Option<String>,_>(18),
-        "affinity_hash":row.get::<Option<String>,_>(19),
-        "affinity_source":row.get::<Option<String>,_>(20),
-        "created_at":row.get::<i64,_>(21),
-        "first_byte_latency_ms":row.get::<Option<i64>,_>(30),
-        "request_bytes":row.get::<i64,_>(31),
-        "response_bytes":row.get::<i64,_>(32),
-        "request_transport_bytes":row.get::<i64,_>(33),
-        "response_transport_bytes":row.get::<i64,_>(34),
-        "downstream_accept_encoding":row.get::<Option<String>,_>(35),
-        "downstream_content_encoding":row.get::<Option<String>,_>(36),
-        "upstream_accept_encoding":row.get::<Option<String>,_>(37),
-        "upstream_content_encoding":row.get::<Option<String>,_>(38),
-        "upstream_http_version":row.get::<Option<String>,_>(41),
-        "official_cost_usd_nanos":row.get::<i64,_>(42),
-        "actual_cost_usd_nanos":row.get::<i64,_>(43),
-        "price_multiplier_nanos":row.get::<i64,_>(44),
-        "official_consumed_usd_before_nanos":row.get::<i64,_>(45),
-        "official_consumed_usd_after_nanos":row.get::<i64,_>(46),
-        "actual_consumed_usd_before_nanos":row.get::<i64,_>(47),
-        "actual_consumed_usd_after_nanos":row.get::<i64,_>(48),
-        "official_provided_usd_before_nanos":row.get::<i64,_>(49),
-        "official_provided_usd_after_nanos":row.get::<i64,_>(50),
-        "actual_provided_usd_before_nanos":row.get::<i64,_>(51),
-        "actual_provided_usd_after_nanos":row.get::<i64,_>(52),
+        "status":row.get::<i64,_>(10),
+        "latency_ms":row.get::<i64,_>(11),
+        "audio_seconds":row.get::<f64,_>(12),
+        "characters":row.get::<i64,_>(13),
+        "error":row.get::<Option<String>,_>(14),
+        "client_ip":row.get::<Option<String>,_>(15),
+        "affinity_hash":row.get::<Option<String>,_>(16),
+        "affinity_source":row.get::<Option<String>,_>(17),
+        "created_at":row.get::<i64,_>(18),
+        "first_byte_latency_ms":row.get::<Option<i64>,_>(27),
+        "request_bytes":row.get::<i64,_>(28),
+        "response_bytes":row.get::<i64,_>(29),
+        "request_transport_bytes":row.get::<i64,_>(30),
+        "response_transport_bytes":row.get::<i64,_>(31),
+        "downstream_accept_encoding":row.get::<Option<String>,_>(32),
+        "downstream_content_encoding":row.get::<Option<String>,_>(33),
+        "upstream_accept_encoding":row.get::<Option<String>,_>(34),
+        "upstream_content_encoding":row.get::<Option<String>,_>(35),
+        "upstream_http_version":row.get::<Option<String>,_>(38),
+        "cost_usd_nanos":row.get::<i64,_>(39),
+        "consumed_usd_before_nanos":row.get::<i64,_>(40),
+        "consumed_usd_after_nanos":row.get::<i64,_>(41),
+        "provided_usd_before_nanos":row.get::<i64,_>(42),
+        "provided_usd_after_nanos":row.get::<i64,_>(43),
         "request_headers":request_headers,
         "upstream_request_headers":upstream_request_headers,
-        "request_body":row.get::<Option<Vec<u8>>,_>(24).map(|body| String::from_utf8_lossy(&body).into_owned()),
-        "request_body_truncated":row.get::<Option<i64>,_>(25).unwrap_or_default() != 0,
+        "request_body":row.get::<Option<Vec<u8>>,_>(21).map(|body| String::from_utf8_lossy(&body).into_owned()),
+        "request_body_truncated":row.get::<Option<i64>,_>(22).unwrap_or_default() != 0,
         "response_headers":response_headers,
         "downstream_response_headers":downstream_response_headers,
-        "response_body":row.get::<Option<Vec<u8>>,_>(27).map(|body| String::from_utf8_lossy(&body).into_owned()),
-        "response_body_truncated":row.get::<Option<i64>,_>(28).unwrap_or_default() != 0,
+        "response_body":row.get::<Option<Vec<u8>>,_>(24).map(|body| String::from_utf8_lossy(&body).into_owned()),
+        "response_body_truncated":row.get::<Option<i64>,_>(25).unwrap_or_default() != 0,
         "previous":navigation(previous),
         "next":navigation(next)
     });
     detail["error_code"] = row
-        .get::<Option<String>, _>(54)
+        .get::<Option<String>, _>(45)
         .map(Value::String)
         .unwrap_or(Value::Null);
     detail["archive_available"] = Value::Bool(archive_available);
@@ -1411,50 +1375,37 @@ pub async fn dashboard(
         .bind(since)
         .fetch_one(&state.db)
         .await?;
-    let peak: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM api_calls WHERE user_id=? AND peak=1 AND created_at>?",
+    let (audio_seconds_24h, characters_24h): (f64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(audio_seconds),0),COALESCE(SUM(characters),0) FROM api_calls WHERE user_id=? AND created_at>?",
     )
     .bind(&user.id)
     .bind(since)
     .fetch_one(&state.db)
     .await?;
-    let (input_tokens_24h, output_tokens_24h, cached_tokens_24h): (i64, i64, i64) =
-        sqlx::query_as(
-            "SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(cached_tokens),0) FROM api_calls WHERE user_id=? AND created_at>?",
-        )
-        .bind(&user.id)
-        .bind(since)
-        .fetch_one(&state.db)
-        .await?;
-    let (official_cost_usd_nanos_24h, actual_cost_usd_nanos_24h): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(SUM(official_cost_usd_nanos),0),COALESCE(SUM(actual_cost_usd_nanos),0) FROM api_calls WHERE user_id=? AND created_at>?",
+    let cost_usd_nanos_24h: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(cost_usd_nanos),0) FROM api_calls WHERE user_id=? AND created_at>?",
     )
     .bind(&user.id)
     .bind(since)
     .fetch_one(&state.db)
     .await?;
-    let (official_consumed_usd_nanos, consumed_usd_nanos): (i64, i64) = sqlx::query_as(
-        "SELECT official_consumed_usd_nanos,consumed_usd_nanos FROM users WHERE id=?",
-    )
-    .bind(&user.id)
-    .fetch_one(&state.db)
-    .await?;
+    let consumed_usd_nanos: i64 =
+        sqlx::query_scalar("SELECT consumed_usd_nanos FROM users WHERE id=?")
+            .bind(&user.id)
+            .fetch_one(&state.db)
+            .await?;
     let config = state.config.load();
     Ok(Json(json!({
         "active_consumers":keys,
         "active_providers":providers,
         "calls_24h":calls,
         "errors_24h":errors,
-        "peak_calls_24h":peak,
-        "input_tokens_24h":input_tokens_24h,
-        "output_tokens_24h":output_tokens_24h,
-        "cached_tokens_24h":cached_tokens_24h,
-        "official_cost_usd_nanos_24h":official_cost_usd_nanos_24h,
-        "actual_cost_usd_nanos_24h":actual_cost_usd_nanos_24h,
-        "official_consumed_usd_nanos":official_consumed_usd_nanos,
+        "audio_seconds_24h":audio_seconds_24h,
+        "characters_24h":characters_24h,
+        "cost_usd_nanos_24h":cost_usd_nanos_24h,
         "consumed_usd_nanos":consumed_usd_nanos,
-        "peak_now":pricing::is_peak(chrono::Utc::now().timestamp()),
-        "available_model_ids":config.available_model_ids
+        "transcription_model_ids":config.transcription_models.iter().map(|item| item.model.clone()).collect::<Vec<_>>(),
+        "speech_model_ids":config.speech_models.iter().map(|item| item.model.clone()).collect::<Vec<_>>()
     })))
 }
 
@@ -1493,14 +1444,21 @@ pub async fn settings(
         "auth_issuer":config.auth_issuer,
         "auth_audience":config.auth_audience,
         "upstream_base":config.upstream_base,
-        "available_model_ids":config.available_model_ids,
-        "web_search_model":config.web_search_model,
+        "transcription_models":config.transcription_models.iter().map(|item| json!({
+            "model": item.model,
+            "price_usd_per_second": payments::format_usd_nanos(item.price_usd_nanos_per_second),
+        })).collect::<Vec<_>>(),
+        "default_transcription_model":config.default_transcription_model,
+        "speech_models":config.speech_models.iter().map(|item| json!({
+            "model": item.model,
+            "price_usd_per_character": payments::format_usd_nanos(item.price_usd_nanos_per_character),
+        })).collect::<Vec<_>>(),
+        "default_speech_model":config.default_speech_model,
         "allow_all_users_debt":config.allow_all_users_debt,
         "response_body_limit":config.response_body_limit,
         "affinity_ttl_seconds":config.affinity_ttl_seconds,
         "provider_concurrency_limit":config.provider_concurrency_limit,
         "request_archive_retention_days":config.request_archive_retention_days,
-        "model_price_multiplier":payments::format_usd_nanos(config.model_price_multiplier_nanos),
         "midas_api_base":config.midas_api_base,
         "midas_fund_user_id":config.midas_fund_user_id,
         "midas_fund_api_key_configured":config.midas_fund_api_key.is_some()
@@ -1516,7 +1474,7 @@ pub async fn provider_audit(
     let period = query.period.unwrap_or(UsagePeriod::Last7Days);
     let until = chrono::Utc::now().timestamp();
     let since = until - period.seconds();
-    let sql = "SELECT (c.created_at / 3600) * 3600 AS hour_start,c.provider_id,p.name,COALESCE(NULLIF(c.model,''),'unknown'),SUM(CASE WHEN NULLIF(c.error_code,'') IS NULL AND c.error IS NULL AND c.status<400 THEN 1 ELSE 0 END),SUM(CASE WHEN c.error_code IS NOT NULL OR c.error IS NOT NULL OR c.status>=400 THEN 1 ELSE 0 END),COALESCE(SUM(c.input_tokens),0),COALESCE(SUM(c.actual_cost_usd_nanos),0),COALESCE(SUM(c.peak),0) FROM api_calls c LEFT JOIN providers p ON p.id=c.provider_id WHERE c.created_at>=? AND c.created_at<=? GROUP BY hour_start,c.provider_id,p.name,COALESCE(NULLIF(c.model,''),'unknown') ORDER BY hour_start DESC,p.name,COALESCE(NULLIF(c.model,''),'unknown')";
+    let sql = "SELECT (c.created_at / 3600) * 3600 AS hour_start,c.provider_id,p.name,COALESCE(NULLIF(c.model,''),'unknown'),SUM(CASE WHEN NULLIF(c.error_code,'') IS NULL AND c.error IS NULL AND c.status<400 THEN 1 ELSE 0 END),SUM(CASE WHEN c.error_code IS NOT NULL OR c.error IS NOT NULL OR c.status>=400 THEN 1 ELSE 0 END),COALESCE(SUM(c.audio_seconds),0),COALESCE(SUM(c.characters),0),COALESCE(SUM(c.cost_usd_nanos),0) FROM api_calls c LEFT JOIN providers p ON p.id=c.provider_id WHERE c.created_at>=? AND c.created_at<=? GROUP BY hour_start,c.provider_id,p.name,COALESCE(NULLIF(c.model,''),'unknown') ORDER BY hour_start DESC,p.name,COALESCE(NULLIF(c.model,''),'unknown')";
     let rows = sqlx::query(sql)
         .bind(since)
         .bind(until)
@@ -1542,45 +1500,83 @@ pub async fn provider_audit(
                 "failed_requests": failed,
                 "success_rate": success_rate,
                 "failure_rate": failure_rate,
-                "input_tokens": row.get::<i64, _>(6),
-                "actual_cost_usd_nanos": row.get::<i64, _>(7),
-                "peak_requests": row.get::<i64, _>(8),
+                "audio_seconds": row.get::<f64, _>(6),
+                "characters": row.get::<i64, _>(7),
+                "cost_usd_nanos": row.get::<i64, _>(8),
             })
         }).collect::<Vec<_>>()
     })))
 }
 
 #[derive(Deserialize)]
-pub struct UpdateAvailableModelIds {
-    available_model_ids: Vec<String>,
+pub struct UpdateTranscriptionModels {
+    models: Vec<TranscriptionModelInput>,
+    default_model: String,
 }
 
-pub async fn update_available_model_ids(
+#[derive(Deserialize)]
+pub struct TranscriptionModelInput {
+    model: String,
+    price_usd_per_second: String,
+}
+
+pub async fn update_transcription_models(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Extension(user): Extension<UserIdentity>,
-    Json(input): Json<UpdateAvailableModelIds>,
+    Json(input): Json<UpdateTranscriptionModels>,
 ) -> Result<Json<Value>, AppError> {
     require_admin(&user)?;
-    let model_ids = config::normalize_available_model_ids(input.available_model_ids)
-        .map_err(AppError::bad_request)?;
-    let value = serde_json::to_string(&model_ids)?;
+    let models_json = voice_models_json(&input.models, |input| {
+        Ok(json!({
+            "model": input.model,
+            "price_usd_nanos_per_second": payments::parse_rate_usd_nanos(
+                &input.price_usd_per_second,
+                "price_usd_per_second",
+                100_000_000,
+            )?,
+        }))
+    })?;
+    let models =
+        config::normalize_transcription_models(models_json).map_err(AppError::bad_request)?;
+    let default_model =
+        require_default_model(&input.default_model, models.iter().map(|item| &item.model))?;
+    let value = serde_json::to_string(
+        &models
+            .iter()
+            .map(|item| {
+                json!({
+                    "model": item.model,
+                    "price_usd_nanos_per_second": item.price_usd_nanos_per_second,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )?;
     let now = chrono::Utc::now().timestamp();
     {
         let _write = state.write_gate.lock().await;
-        sqlx::query("UPDATE app_meta SET value=?,updated_at=? WHERE key='available_model_ids'")
-            .bind(value)
-            .bind(now)
-            .execute(&state.db)
-            .await?;
+        let mut transaction = state.db.begin().await?;
+        for (key, value) in [
+            ("transcription_models", value.as_str()),
+            ("default_transcription_model", default_model.as_str()),
+        ] {
+            sqlx::query("UPDATE app_meta SET value=?,updated_at=? WHERE key=?")
+                .bind(value)
+                .bind(now)
+                .bind(key)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
     }
     let mut config = (**state.config.load()).clone();
-    config.available_model_ids = model_ids;
+    config.transcription_models = models;
+    config.default_transcription_model = default_model;
     state.config.store(std::sync::Arc::new(config));
     write_admin_audit(
         &state,
         &user.id,
-        "settings.available_models.update",
+        "settings.transcription_models.update",
         None,
         &peer.ip().to_string(),
     )
@@ -1589,39 +1585,102 @@ pub async fn update_available_model_ids(
 }
 
 #[derive(Deserialize)]
-pub struct UpdateWebSearchModel {
-    web_search_model: String,
+pub struct UpdateSpeechModels {
+    models: Vec<SpeechModelInput>,
+    default_model: String,
 }
 
-/// The model that runs the auxiliary turn behind one `/v1/web-search` call.
-pub async fn update_web_search_model(
+#[derive(Deserialize)]
+pub struct SpeechModelInput {
+    model: String,
+    price_usd_per_character: String,
+}
+
+pub async fn update_speech_models(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Extension(user): Extension<UserIdentity>,
-    Json(input): Json<UpdateWebSearchModel>,
+    Json(input): Json<UpdateSpeechModels>,
 ) -> Result<Json<Value>, AppError> {
     require_admin(&user)?;
-    let web_search_model = required_setting("web search model", &input.web_search_model)?;
+    let models_json = voice_models_json(&input.models, |input| {
+        Ok(json!({
+            "model": input.model,
+            "price_usd_nanos_per_character": payments::parse_rate_usd_nanos(
+                &input.price_usd_per_character,
+                "price_usd_per_character",
+                1_000_000,
+            )?,
+        }))
+    })?;
+    let models = config::normalize_speech_models(models_json).map_err(AppError::bad_request)?;
+    let default_model =
+        require_default_model(&input.default_model, models.iter().map(|item| &item.model))?;
+    let value = serde_json::to_string(
+        &models
+            .iter()
+            .map(|item| {
+                json!({
+                    "model": item.model,
+                    "price_usd_nanos_per_character": item.price_usd_nanos_per_character,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    let now = chrono::Utc::now().timestamp();
     {
         let _write = state.write_gate.lock().await;
-        sqlx::query("UPDATE app_meta SET value=?,updated_at=? WHERE key='web_search_model'")
-            .bind(&web_search_model)
-            .bind(chrono::Utc::now().timestamp())
-            .execute(&state.db)
-            .await?;
-        let mut config = (**state.config.load()).clone();
-        config.web_search_model = web_search_model;
-        state.config.store(std::sync::Arc::new(config));
+        let mut transaction = state.db.begin().await?;
+        for (key, value) in [
+            ("speech_models", value.as_str()),
+            ("default_speech_model", default_model.as_str()),
+        ] {
+            sqlx::query("UPDATE app_meta SET value=?,updated_at=? WHERE key=?")
+                .bind(value)
+                .bind(now)
+                .bind(key)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
     }
+    let mut config = (**state.config.load()).clone();
+    config.speech_models = models;
+    config.default_speech_model = default_model;
+    state.config.store(std::sync::Arc::new(config));
     write_admin_audit(
         &state,
         &user.id,
-        "settings.web_search.update",
+        "settings.speech_models.update",
         None,
         &peer.ip().to_string(),
     )
     .await?;
     Ok(Json(json!({"ok":true})))
+}
+
+fn voice_models_json<T>(
+    items: &[T],
+    convert: impl Fn(&T) -> Result<Value, AppError>,
+) -> Result<Value, AppError> {
+    Ok(Value::Array(
+        items
+            .iter()
+            .map(convert)
+            .collect::<Result<Vec<Value>, AppError>>()?,
+    ))
+}
+
+fn require_default_model<'a>(
+    default_model: &str,
+    models: impl Iterator<Item = &'a String>,
+) -> Result<String, AppError> {
+    let default_model = default_model.trim().to_owned();
+    models
+        .into_iter()
+        .any(|model| model == &default_model)
+        .then_some(default_model)
+        .ok_or_else(|| AppError::bad_request("default_model must name a configured model"))
 }
 
 #[derive(Deserialize)]
@@ -1675,7 +1734,6 @@ pub struct UpdateSettings {
     response_body_limit: usize,
     affinity_ttl_seconds: i64,
     request_archive_retention_days: i64,
-    model_price_multiplier: String,
 }
 
 pub async fn update_settings(
@@ -1686,8 +1744,6 @@ pub async fn update_settings(
 ) -> Result<Json<Value>, AppError> {
     require_root(&root)?;
     let upstream_base = validate_http_url("upstream base", &input.upstream_base)?;
-    let model_price_multiplier_nanos =
-        payments::parse_model_price_multiplier_nanos(&input.model_price_multiplier)?;
     if !(1_024..=48 * 1_024 * 1_024).contains(&input.response_body_limit)
         || !(60..=2_592_000).contains(&input.affinity_ttl_seconds)
         || !(1..=365).contains(&input.request_archive_retention_days)
@@ -1711,10 +1767,6 @@ pub async fn update_settings(
             "request_archive_retention_days",
             input.request_archive_retention_days.to_string(),
         ),
-        (
-            "model_price_multiplier_nanos",
-            model_price_multiplier_nanos.to_string(),
-        ),
     ];
     let now = chrono::Utc::now().timestamp();
     {
@@ -1736,7 +1788,6 @@ pub async fn update_settings(
     config.response_body_limit = input.response_body_limit;
     config.affinity_ttl_seconds = input.affinity_ttl_seconds;
     config.request_archive_retention_days = input.request_archive_retention_days;
-    config.model_price_multiplier_nanos = model_price_multiplier_nanos;
     state.config.store(std::sync::Arc::new(config));
     write_admin_audit(
         &state,
@@ -1794,7 +1845,7 @@ pub async fn list_users(
     let topups = if midas::is_configured(&state.config.load_full()) {
         midas::inbound_transfer_totals(&state, &user_ids).await?
     } else {
-        std::collections::HashMap::new()
+        HashMap::new()
     };
     Ok(Json(Value::Array(
         rows.into_iter()
@@ -1913,676 +1964,190 @@ async fn write_admin_audit(
 
 #[cfg(test)]
 mod tests {
-    use axum::extract::Query;
+    use axum::extract::{ConnectInfo, Extension, Query};
+    use std::net::SocketAddr;
 
     use super::*;
 
-    fn root_identity() -> UserIdentity {
+    fn identity(id: &str, role: &str) -> UserIdentity {
         UserIdentity {
-            id: "root".to_owned(),
+            id: id.to_owned(),
             email: None,
             name: None,
-            role: "root".to_owned(),
+            role: role.to_owned(),
         }
     }
 
-    fn user_identity() -> UserIdentity {
-        UserIdentity {
-            id: "user".to_owned(),
-            email: None,
-            name: None,
-            role: "user".to_owned(),
-        }
-    }
-
-    fn peer() -> ConnectInfo<SocketAddr> {
-        ConnectInfo("127.0.0.1:8080".parse().unwrap())
+    async fn seed_call(
+        state: &AppState,
+        id: &str,
+        model: &str,
+        status: i64,
+        audio_seconds: f64,
+        cost_usd_nanos: i64,
+    ) {
+        sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,model,status,latency_ms,audio_seconds,characters,cost_usd_nanos,created_at) VALUES(?,?, 'key','user','POST','/v1/audio/transcriptions',?,?,1,?,0,?,unixepoch())")
+            .bind(id)
+            .bind(id)
+            .bind(model)
+            .bind(status)
+            .bind(audio_seconds)
+            .bind(cost_usd_nanos)
+            .execute(&state.db)
+            .await
+            .unwrap();
     }
 
     async fn seed_users(state: &AppState) {
-        for (id, role) in [("root", "root"), ("user", "user")] {
-            sqlx::query("INSERT INTO users(id,role,created_at) VALUES(?,?,0)")
-                .bind(id)
-                .bind(role)
-                .execute(&state.db)
-                .await
-                .unwrap();
-        }
-    }
-
-    async fn seed_consumer(state: &AppState, id: &str, owner: &str, secret: &str) {
-        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES(?,?,?,?,?,0)")
-            .bind(id)
-            .bind(owner)
-            .bind(id)
-            .bind(id)
-            .bind(consumer_secret_hash(secret))
+        sqlx::query("INSERT INTO users(id,role,created_at) VALUES('user','user',0)")
             .execute(&state.db)
             .await
             .unwrap();
-    }
-
-    async fn seed_provider(state: &AppState, id: &str, owner: &str) {
-        sqlx::query("INSERT INTO providers(id,name,api_key,status,created_at,updated_at,owner_id,visibility) VALUES(?,?,?,'active',0,0,?,?)")
-            .bind(id)
-            .bind(id)
-            .bind(format!("sk-{id}"))
-            .bind(owner)
-            .bind(balancer::PROVIDER_VISIBILITY_PRIVATE)
+        sqlx::query("INSERT INTO users(id,role,created_at) VALUES('admin','admin',0)")
             .execute(&state.db)
             .await
             .unwrap();
-        state.balancer.reload_providers(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('key','user','key','sk-test','hash',0)")
+            .execute(&state.db)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn provider_lifecycle_round_trips_one_api_key() {
+    async fn audio_prices_render_seeded_rates() {
+        let state = crate::test_state("http://upstream.invalid").await;
+        let Json(value) = audio_prices(State(state)).await;
+        assert_eq!(
+            value["transcription"][0]["price_usd_per_second"],
+            "0.000030556"
+        );
+        assert_eq!(value["speech"][0]["price_usd_per_character"], "0.000011111");
+    }
+
+    #[tokio::test]
+    async fn usage_rows_sum_audio_seconds_and_characters_per_day() {
         let state = crate::test_state("http://upstream.invalid").await;
         seed_users(&state).await;
-
-        let created = create_provider(
-            State(state.clone()),
-            peer(),
-            Extension(root_identity()),
-            Json(CreateProvider {
-                name: "primary".to_owned(),
-                api_key: "sk-deepseek-primary".to_owned(),
-                visibility: Some("public".to_owned()),
+        seed_call(
+            &state,
+            "call-1",
+            "qwen-audio-3.0-asr-flash",
+            200,
+            2.0,
+            61112,
+        )
+        .await;
+        seed_call(
+            &state,
+            "call-2",
+            "qwen-audio-3.0-asr-flash",
+            200,
+            1.5,
+            45834,
+        )
+        .await;
+        let Json(value) = usage(
+            State(state),
+            Extension(identity("user", "user")),
+            Query(UsageQuery {
+                period: Some(UsagePeriod::Last24Hours),
             }),
         )
         .await
         .unwrap();
-        let id = created.0["id"].as_str().unwrap().to_owned();
-        assert_eq!(created.0["visibility"], "public");
+        let rows = value["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["requests"], 2);
+        assert_eq!(rows[0]["audio_seconds"], 3.5);
+        assert_eq!(rows[0]["cost_usd_nanos"], 106946);
+    }
 
-        let listed = list_providers(State(state.clone()), Extension(root_identity()))
-            .await
-            .unwrap();
-        let provider = &listed.0[0];
-        assert_eq!(provider["name"], "primary");
+    #[tokio::test]
+    async fn transcription_models_update_validates_and_persists() {
+        let state = crate::test_state("http://upstream.invalid").await;
+        seed_users(&state).await;
+        let Json(value) = update_transcription_models(
+            State(state.clone()),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+            Extension(identity("admin", "admin")),
+            Json(UpdateTranscriptionModels {
+                models: vec![
+                    TranscriptionModelInput {
+                        model: "qwen-audio-3.0-asr-flash".to_owned(),
+                        price_usd_per_second: "0.00002".to_owned(),
+                    },
+                    TranscriptionModelInput {
+                        model: "qwen-audio-3.1-asr-flash".to_owned(),
+                        price_usd_per_second: "0.00002".to_owned(),
+                    },
+                ],
+                default_model: "qwen-audio-3.1-asr-flash".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["ok"], true);
+        let config = state.config.load_full();
+        assert_eq!(config.transcription_models.len(), 2);
         assert_eq!(
-            provider["api_key"],
-            json!(null),
-            "the key never leaves the server"
+            config.default_transcription_model,
+            "qwen-audio-3.1-asr-flash"
         );
-        assert_eq!(provider["usage"], json!(null));
-
-        let _ = update_provider(
-            State(state.clone()),
-            peer(),
-            Extension(root_identity()),
-            Path(id.clone()),
-            Json(ProviderUpdate {
-                name: Some("renamed".to_owned()),
-                enabled: Some(false),
-                visibility: Some("private".to_owned()),
-            }),
+        let stored: String = sqlx::query_scalar(
+            "SELECT value FROM app_meta WHERE key='default_transcription_model'",
         )
-        .await
-        .unwrap();
-        let (name, status, disabled, visibility): (String, String, i64, String) = sqlx::query_as(
-            "SELECT name,status,manual_disabled,visibility FROM providers WHERE id=?",
-        )
-        .bind(&id)
         .fetch_one(&state.db)
         .await
         .unwrap();
-        assert_eq!(name, "renamed");
-        assert_eq!(status, "disabled");
-        assert_eq!(disabled, 1);
-        assert_eq!(visibility, "private");
+        assert_eq!(stored, "qwen-audio-3.1-asr-flash");
 
-        let (headers, key) = read_provider_key(
+        let rejected = update_transcription_models(
             State(state.clone()),
-            peer(),
-            Extension(root_identity()),
-            Path(id.clone()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
-        assert_eq!(key.0["api_key"], "sk-deepseek-primary");
-
-        let _ = replace_provider_key(
-            State(state.clone()),
-            peer(),
-            Extension(root_identity()),
-            Path(id.clone()),
-            Json(ReplaceProviderKey {
-                name: None,
-                api_key: "sk-deepseek-rotated".to_owned(),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+            Extension(identity("admin", "admin")),
+            Json(UpdateTranscriptionModels {
+                models: vec![],
+                default_model: "qwen-audio-3.0-asr-flash".to_owned(),
             }),
         )
-        .await
-        .unwrap();
-        let (api_key, status, disabled): (String, String, i64) =
-            sqlx::query_as("SELECT api_key,status,manual_disabled FROM providers WHERE id=?")
-                .bind(&id)
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
-        assert_eq!(api_key, "sk-deepseek-rotated");
-        assert_eq!(
-            status, "disabled",
-            "a manual disable survives a key rotation"
-        );
-        assert_eq!(disabled, 1);
-
-        let _ = delete_provider(
-            State(state.clone()),
-            peer(),
-            Extension(root_identity()),
-            Path(id.clone()),
-        )
-        .await
-        .unwrap();
-        let deleted: i64 = sqlx::query_scalar("SELECT is_deleted FROM providers WHERE id=?")
-            .bind(&id)
-            .fetch_one(&state.db)
-            .await
-            .unwrap();
-        assert_eq!(deleted, 1);
-        let listed = list_providers(State(state.clone()), Extension(root_identity()))
-            .await
-            .unwrap();
-        assert!(listed.0.as_array().unwrap().is_empty());
+        .await;
+        assert!(rejected.is_err());
     }
 
     #[tokio::test]
-    async fn provider_usage_and_load_are_reported_per_provider() {
+    async fn provider_usage_counts_errors_and_audio() {
         let state = crate::test_state("http://upstream.invalid").await;
         seed_users(&state).await;
-        seed_consumer(&state, "consumer", "user", "sk-consumer").await;
-        seed_provider(&state, "provider", "user").await;
-        for (id, peak, tokens, cost, error) in [
-            ("first", 1_i64, 10_i64, 5_i64, None),
-            ("second", 0, 20, 7, Some("boom")),
-        ] {
-            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,provider_id,method,path,model,peak,status,latency_ms,input_tokens,output_tokens,actual_cost_usd_nanos,error,created_at) VALUES(?,?, 'consumer','user','provider','POST','/v1/chat/completions','deepseek-flash',?,200,10,?,0,?,?,unixepoch())")
-                .bind(id)
-                .bind(id)
-                .bind(peak)
-                .bind(tokens)
-                .bind(cost)
-                .bind(error)
-                .execute(&state.db)
-                .await
-                .unwrap();
-        }
-
-        let listed = list_providers(State(state.clone()), Extension(user_identity()))
-            .await
-            .unwrap();
-        let usage = &listed.0[0]["usage"];
-        assert_eq!(usage["requests"], 2);
-        assert_eq!(usage["errors"], 1);
-        assert_eq!(usage["peak_requests"], 1);
-        assert_eq!(usage["input_tokens"], 30);
-        assert_eq!(usage["actual_cost_usd_nanos"], 12);
-        assert_eq!(listed.0[0]["inflight"], 0);
-        assert_eq!(listed.0[0]["queued"], 0);
-        assert_eq!(listed.0[0]["concurrency_limit"], 3);
-
-        // Another user never sees a private provider of someone else.
-        sqlx::query("INSERT INTO users(id,role,created_at) VALUES('other','user',0)")
+        sqlx::query("INSERT INTO providers(id,name,api_key,owner_id,created_at,updated_at) VALUES('provider','provider','sk-qwen','user',0,0)")
             .execute(&state.db)
             .await
             .unwrap();
-        let hidden = list_providers(
-            State(state.clone()),
-            Extension(UserIdentity {
-                id: "other".to_owned(),
-                email: None,
-                name: None,
-                role: "user".to_owned(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(hidden.0.as_array().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn consumer_lifecycle_never_carries_the_degradation_switch() {
-        let state = crate::test_state("http://upstream.invalid").await;
-        seed_users(&state).await;
-
-        let created = create_consumer(
-            State(state.clone()),
-            Extension(user_identity()),
-            Json(CreateConsumer {
-                name: "app".to_owned(),
-                request_archive: true,
-            }),
-        )
-        .await
-        .unwrap();
-        let id = created.0["id"].as_str().unwrap().to_owned();
-        let secret = created.0["secret"].as_str().unwrap().to_owned();
-        assert!(secret.starts_with("sk-"));
-        assert_eq!(created.0["is_disabled"], false);
-
-        let verified = verify_consumer_credential(
-            State(state.clone()),
-            Extension(user_identity()),
-            Path(id.clone()),
-            Json(VerifyConsumerCredential {
-                secret: secret.clone(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(verified.0["credential_matches"], true);
-        assert_eq!(verified.0["request_archive"], true);
-
-        let _ = update_consumer(
-            State(state.clone()),
-            Extension(user_identity()),
-            Path(id.clone()),
-            Json(UpdateConsumer {
-                name: Some("app-2".to_owned()),
-                request_archive: Some(false),
-                is_disabled: Some(true),
-            }),
-        )
-        .await
-        .unwrap();
-        let listed = list_consumers(State(state.clone()), Extension(user_identity()))
-            .await
-            .unwrap();
-        assert_eq!(listed.0[0]["name"], "app-2");
-        assert_eq!(listed.0[0]["is_disabled"], true);
-
-        let rotated = rotate_consumer(
-            State(state.clone()),
-            Extension(user_identity()),
-            Path(id.clone()),
-        )
-        .await
-        .unwrap();
-        assert_ne!(rotated.0["secret"], secret);
-        let old_secret_matches: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM consumers WHERE id=? AND secret_hash=?")
-                .bind(&id)
-                .bind(consumer_secret_hash(&secret))
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
-        assert_eq!(old_secret_matches, 0);
-
-        let _ = delete_consumer(
-            State(state.clone()),
-            Extension(user_identity()),
-            Path(id.clone()),
-        )
-        .await
-        .unwrap();
-        let deleted: i64 = sqlx::query_scalar("SELECT is_deleted FROM consumers WHERE id=?")
-            .bind(&id)
-            .fetch_one(&state.db)
-            .await
-            .unwrap();
-        assert_eq!(deleted, 1);
-    }
-
-    #[tokio::test]
-    async fn settings_updates_persist_into_app_meta_and_config() {
-        let state = crate::test_state("http://upstream.invalid").await;
-        seed_users(&state).await;
-
-        let _ = update_settings(
-            State(state.clone()),
-            peer(),
-            Extension(root_identity()),
-            Json(UpdateSettings {
-                upstream_base: "https://api.deepseek.com/".to_owned(),
-                allow_all_users_debt: true,
-                response_body_limit: 4_194_304,
-                affinity_ttl_seconds: 7_200,
-                request_archive_retention_days: 3,
-                model_price_multiplier: "1.2".to_owned(),
-            }),
-        )
-        .await
-        .unwrap();
-        let config = state.config.load_full();
-        assert_eq!(config.upstream_base, "https://api.deepseek.com");
-        assert!(config.allow_all_users_debt);
-        assert_eq!(config.response_body_limit, 4_194_304);
-        assert_eq!(config.affinity_ttl_seconds, 7_200);
-        assert_eq!(config.request_archive_retention_days, 3);
-        assert_eq!(config.model_price_multiplier_nanos, 1_200_000_000);
-
-        let _ = update_available_model_ids(
-            State(state.clone()),
-            peer(),
-            Extension(root_identity()),
-            Json(UpdateAvailableModelIds {
-                available_model_ids: vec![
-                    " deepseek-flash ".to_owned(),
-                    "deepseek-v4-pro".to_owned(),
-                ],
-            }),
-        )
-        .await
-        .unwrap();
-        let stored: String =
-            sqlx::query_scalar("SELECT value FROM app_meta WHERE key='available_model_ids'")
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
-        assert_eq!(stored, r#"["deepseek-flash","deepseek-v4-pro"]"#);
-        assert_eq!(
-            state.config.load().available_model_ids,
-            vec!["deepseek-flash".to_owned(), "deepseek-v4-pro".to_owned()]
-        );
-
-        let _ = update_provider_concurrency(
-            State(state.clone()),
-            peer(),
-            Extension(root_identity()),
-            Json(UpdateProviderConcurrency {
-                provider_concurrency_limit: 8,
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(state.config.load().provider_concurrency_limit, 8);
-        let audit_actions: Vec<String> =
-            sqlx::query_scalar("SELECT action FROM admin_audit ORDER BY created_at, action")
-                .fetch_all(&state.db)
-                .await
-                .unwrap();
-        assert_eq!(
-            audit_actions,
-            vec![
-                "settings.available_models.update",
-                "settings.provider_concurrency.update",
-                "settings.update",
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn the_web_search_model_is_a_persisted_operational_setting() {
-        let state = crate::test_state("http://upstream.invalid").await;
-        seed_users(&state).await;
-
-        let _ = update_web_search_model(
-            State(state.clone()),
-            peer(),
-            Extension(root_identity()),
-            Json(UpdateWebSearchModel {
-                web_search_model: " deepseek-v4-pro ".to_owned(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(state.config.load().web_search_model, "deepseek-v4-pro");
-        let stored: String =
-            sqlx::query_scalar("SELECT value FROM app_meta WHERE key='web_search_model'")
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
-        assert_eq!(stored, "deepseek-v4-pro");
-
-        let error = update_web_search_model(
-            State(state.clone()),
-            peer(),
-            Extension(root_identity()),
-            Json(UpdateWebSearchModel {
-                web_search_model: "   ".to_owned(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(
-            state.config.load().web_search_model,
-            "deepseek-v4-pro",
-            "a rejected value leaves the running configuration alone"
-        );
-    }
-
-    #[tokio::test]
-    async fn settings_body_limit_is_capped_at_48_mib() {
-        let state = crate::test_state("http://upstream.invalid").await;
-        seed_users(&state).await;
-
-        let settings = |response_body_limit| UpdateSettings {
-            upstream_base: "https://api.deepseek.com".to_owned(),
-            allow_all_users_debt: false,
-            response_body_limit,
-            affinity_ttl_seconds: 7_200,
-            request_archive_retention_days: 3,
-            model_price_multiplier: "1.0".to_owned(),
-        };
-
-        let _ = update_settings(
-            State(state.clone()),
-            peer(),
-            Extension(root_identity()),
-            Json(settings(48 * 1_024 * 1_024)),
-        )
-        .await
-        .expect("48 MiB is the largest allowed body limit");
-        assert_eq!(state.config.load().response_body_limit, 48 * 1_024 * 1_024);
-
-        assert!(
-            update_settings(
-                State(state.clone()),
-                peer(),
-                Extension(root_identity()),
-                Json(settings(48 * 1_024 * 1_024 + 1)),
-            )
-            .await
-            .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn audit_rows_expose_peak_pricing_and_filters() {
-        let state = crate::test_state("http://upstream.invalid").await;
-        seed_users(&state).await;
-        seed_consumer(&state, "consumer", "user", "sk-consumer").await;
-        seed_provider(&state, "provider", "user").await;
-        for (id, peak) in [("peak-call", 1_i64), ("off-peak-call", 0)] {
-            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,provider_id,method,path,model,peak,status,latency_ms,actual_cost_usd_nanos,created_at) VALUES(?,?, 'consumer','user','provider','POST','/v1/chat/completions','deepseek-flash',?,200,10,7,unixepoch())")
-                .bind(id)
-                .bind(id)
-                .bind(peak)
-                .execute(&state.db)
-                .await
-                .unwrap();
-        }
-
-        let listed = audit(
-            State(state.clone()),
-            Extension(user_identity()),
-            Query(AuditQuery {
-                limit: None,
-                offset: None,
-                user_id: None,
-                consumer: None,
-                provider: Some("provider".to_owned()),
-                model: Some("deepseek-flash".to_owned()),
-                status: None,
-                error_code: None,
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(listed.0["total"], 2);
-        let rows = listed.0["rows"].as_array().unwrap();
-        assert_eq!(rows[0]["peak"], true, "newest row first");
-        assert_eq!(rows[0]["provider_name"], "provider");
-        assert_eq!(rows[1]["peak"], false);
-
-        let errors = audit(
-            State(state.clone()),
-            Extension(user_identity()),
-            Query(AuditQuery {
-                limit: None,
-                offset: None,
-                user_id: None,
-                consumer: None,
-                provider: None,
-                model: None,
-                status: Some(AuditStatus::Error),
-                error_code: None,
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(errors.0["total"], 0);
-
-        let dashboard = dashboard(State(state.clone()), Extension(user_identity()))
-            .await
-            .unwrap();
-        assert_eq!(dashboard.0["calls_24h"], 2);
-        assert_eq!(dashboard.0["peak_calls_24h"], 1);
-        assert_eq!(
-            dashboard.0["active_providers"], 1,
-            "the caller owns one provider"
-        );
-        assert_eq!(dashboard.0["available_model_ids"][0], "deepseek-flash");
-    }
-
-    #[tokio::test]
-    async fn audit_detail_decodes_archives_and_links_thread_neighbours() {
-        let state = crate::test_state("http://upstream.invalid").await;
-        seed_users(&state).await;
-        seed_consumer(&state, "consumer", "user", "sk-consumer").await;
-        seed_provider(&state, "provider", "user").await;
-        for (id, error_code, created_at) in [
-            ("first", None, 100_i64),
-            ("second", Some("server_error"), 200),
-        ] {
-            sqlx::query("INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,method,path,model,peak,status,latency_ms,input_tokens,actual_cost_usd_nanos,actual_provided_usd_after_nanos,error_code,created_at) VALUES(?,?,'thread-1','consumer','user','provider','POST','/v1/chat/completions','deepseek-flash',0,200,10,5,3,7,?,?)")
-                .bind(id)
-                .bind(format!("req-{id}"))
-                .bind(error_code)
-                .bind(created_at)
-                .execute(&state.db)
-                .await
-                .unwrap();
-        }
-        sqlx::query("INSERT INTO request_archives(api_call_id,request_headers_json,upstream_request_headers_json,request_body,request_body_truncated,response_headers_json,downstream_response_headers_json,response_body,response_body_truncated,bodies_deleted,created_at) VALUES('second','[]','[]',X'7B7D',0,'[]',NULL,X'5B5D',0,0,unixepoch())")
-            .execute(&state.db)
-            .await
-            .unwrap();
-
-        let detail = audit_detail(
-            State(state.clone()),
-            Extension(user_identity()),
-            Path("second".to_owned()),
-        )
-        .await
-        .unwrap();
-        let value = detail.0;
-        assert_eq!(value["error_code"], "server_error");
-        assert_eq!(value["error"], json!(null));
-        assert_eq!(value["archive_available"], json!(true));
-        assert_eq!(
-            value["bodies_available"],
-            json!(true),
-            "provided-value columns must not be mistaken for bodies_deleted"
-        );
-        assert_eq!(value["request_body"], "{}");
-        assert_eq!(value["actual_provided_usd_after_nanos"], json!(7));
-        assert_eq!(value["previous"]["id"], "first");
-        assert_eq!(value["previous"]["request_id"], "req-first");
-        assert_eq!(value["next"], json!(null));
-
-        let first = audit_detail(
-            State(state.clone()),
-            Extension(user_identity()),
-            Path("first".to_owned()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(first.0["error_code"], json!(null));
-        assert_eq!(first.0["archive_available"], json!(false));
-        assert_eq!(first.0["bodies_available"], json!(false));
-        assert_eq!(first.0["previous"], json!(null));
-        assert_eq!(first.0["next"]["id"], "second");
-
-        sqlx::query("UPDATE request_archives SET bodies_deleted=1 WHERE api_call_id='second'")
-            .execute(&state.db)
-            .await
-            .unwrap();
-        let deleted = audit_detail(
-            State(state.clone()),
-            Extension(user_identity()),
-            Path("second".to_owned()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(deleted.0["archive_available"], json!(true));
-        assert_eq!(deleted.0["bodies_available"], json!(false));
-    }
-
-    #[tokio::test]
-    async fn model_prices_only_list_available_models() {
-        let state = crate::test_state("http://upstream.invalid").await;
-        sqlx::query(
-            "UPDATE app_meta SET value='[\"deepseek-v4-pro\"]' WHERE key='available_model_ids'",
-        )
-        .execute(&state.db)
-        .await
-        .unwrap();
-        let mut config = (**state.config.load()).clone();
-        config.available_model_ids = vec!["deepseek-v4-pro".to_owned()];
-        state.config.store(std::sync::Arc::new(config));
-
-        let prices = model_prices(State(state.clone())).await;
-        let rows = prices.0["rows"].as_array().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["model"], "deepseek-v4-pro");
-        assert!(
-            rows[0]["peak"]["cache_hit_usd_nanos"].as_i64().unwrap()
-                < rows[0]["peak"]["cache_miss_usd_nanos"].as_i64().unwrap()
-        );
-        assert!(
-            rows[0]["off_peak"]["output_usd_nanos"].as_i64().unwrap()
-                < rows[0]["peak"]["output_usd_nanos"].as_i64().unwrap(),
-            "off-peak is cheaper than peak"
-        );
-    }
-
-    #[tokio::test]
-    async fn provider_audit_groups_requests_by_hour_and_provider() {
-        let state = crate::test_state("http://upstream.invalid").await;
-        seed_users(&state).await;
-        seed_consumer(&state, "consumer", "user", "sk-consumer").await;
-        seed_provider(&state, "provider", "user").await;
-        for (id, status, error_code) in
-            [("ok", 200_i64, None), ("failed", 500, Some("server_error"))]
-        {
-            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,provider_id,method,path,model,peak,status,latency_ms,input_tokens,actual_cost_usd_nanos,error_code,created_at) VALUES(?,?, 'consumer','user','provider','POST','/v1/chat/completions','deepseek-flash',0,?,10,11,3,?,unixepoch())")
+        for (id, status, seconds) in [("a", 200, 1.0_f64), ("b", 429, 2.0)] {
+            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,provider_id,method,path,status,latency_ms,audio_seconds,cost_usd_nanos,created_at) VALUES(?,?, 'key','user','provider','POST','/v1/audio/transcriptions',?,1,?,100,unixepoch())")
                 .bind(id)
                 .bind(id)
                 .bind(status)
-                .bind(error_code)
+                .bind(seconds)
                 .execute(&state.db)
                 .await
                 .unwrap();
         }
+        let usage = provider_usage(&state, ProviderUsageScope::All)
+            .await
+            .unwrap();
+        let usage = usage.get("provider").unwrap();
+        assert_eq!(usage.requests, 2);
+        assert_eq!(usage.errors, 1);
+        assert_eq!(usage.audio_seconds, 3.0);
+        assert_eq!(usage.cost_usd_nanos, 200);
+    }
 
-        let report = provider_audit(
-            State(state.clone()),
-            Extension(root_identity()),
-            Query(UsageQuery { period: None }),
-        )
-        .await
-        .unwrap();
-        let rows = report.0["rows"].as_array().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["requests"], 2);
-        assert_eq!(rows[0]["successful_requests"], 1);
-        assert_eq!(rows[0]["failed_requests"], 1);
-        assert_eq!(rows[0]["input_tokens"], 22);
-        assert_eq!(rows[0]["actual_cost_usd_nanos"], 6);
-        assert_eq!(rows[0]["provider_name"], "provider");
+    #[test]
+    fn model_catalog_parsing_reads_ids() {
+        let ids = model_ids_from_catalog(
+            r#"{"object":"list","data":[{"id":"qwen-audio-3.0-asr-flash"},{"id":"qwen3-tts-flash"}]}"#,
+        );
+        assert_eq!(ids, vec!["qwen-audio-3.0-asr-flash", "qwen3-tts-flash"]);
+        assert!(model_ids_from_catalog("not json").is_empty());
     }
 }

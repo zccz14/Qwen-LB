@@ -11,10 +11,8 @@ pub mod crypto;
 pub mod db;
 pub mod midas;
 pub mod payments;
-pub mod pricing;
 pub mod proxy;
 pub mod resources;
-pub mod web_search;
 
 use std::{sync::Arc, time::Duration};
 
@@ -99,14 +97,18 @@ impl AppState {
 
 pub fn router(state: AppState) -> Router {
     let config = state.config.load();
-    let response_limit = config.response_body_limit;
     drop(config);
     let browser_api = Router::new()
         .route("/api/me", get(api::me))
         .route(
-            "/api/web-search",
-            post(proxy::handle_console_web_search)
-                .layer(RequestBodyLimitLayer::new(proxy::WEB_SEARCH_BODY_LIMIT)),
+            "/api/transcriptions",
+            post(proxy::handle_console_transcription)
+                .layer(RequestBodyLimitLayer::new(proxy::TRANSCRIPTION_BODY_LIMIT)),
+        )
+        .route(
+            "/api/speech",
+            post(proxy::handle_console_speech)
+                .layer(RequestBodyLimitLayer::new(proxy::SPEECH_BODY_LIMIT)),
         )
         .route(
             "/api/consumers",
@@ -134,9 +136,8 @@ pub fn router(state: AppState) -> Router {
             get(api::read_provider_key).put(api::replace_provider_key),
         )
         .route("/api/providers/{id}/test", post(api::test_provider))
-        .route("/api/providers/{id}/balance", get(api::provider_balance))
         .route("/api/usage", get(api::usage))
-        .route("/api/model-prices", get(api::model_prices))
+        .route("/api/audio-prices", get(api::audio_prices))
         .route("/api/audit", get(api::audit))
         .route("/api/provider-audit", get(api::provider_audit))
         .route("/api/audit/{id}", get(api::audit_detail))
@@ -155,16 +156,16 @@ pub fn router(state: AppState) -> Router {
             get(api::settings).patch(api::update_settings),
         )
         .route(
-            "/api/settings/available-models",
-            patch(api::update_available_model_ids),
+            "/api/settings/transcription-models",
+            patch(api::update_transcription_models),
+        )
+        .route(
+            "/api/settings/speech-models",
+            patch(api::update_speech_models),
         )
         .route(
             "/api/settings/provider-concurrency",
             patch(api::update_provider_concurrency),
-        )
-        .route(
-            "/api/settings/web-search",
-            patch(api::update_web_search_model),
         )
         .route("/api/users", get(api::list_users))
         .route("/api/users/{id}", patch(api::update_user))
@@ -172,33 +173,25 @@ pub fn router(state: AppState) -> Router {
 
     let consumer_api = Router::new()
         .route(
-            "/v1/chat/completions",
-            post(proxy::handle_json).layer(RequestBodyLimitLayer::new(response_limit)),
+            "/v1/audio/transcriptions",
+            post(proxy::handle_transcription)
+                .layer(RequestBodyLimitLayer::new(proxy::TRANSCRIPTION_BODY_LIMIT)),
         )
         .route(
-            "/v1/responses",
-            post(proxy::handle_json).layer(RequestBodyLimitLayer::new(response_limit)),
+            "/audio/transcriptions",
+            post(proxy::handle_transcription)
+                .layer(RequestBodyLimitLayer::new(proxy::TRANSCRIPTION_BODY_LIMIT)),
         )
         .route(
-            "/chat/completions",
-            post(proxy::handle_json).layer(RequestBodyLimitLayer::new(response_limit)),
+            "/v1/audio/speech",
+            post(proxy::handle_speech).layer(RequestBodyLimitLayer::new(proxy::SPEECH_BODY_LIMIT)),
         )
         .route(
-            "/responses",
-            post(proxy::handle_json).layer(RequestBodyLimitLayer::new(response_limit)),
+            "/audio/speech",
+            post(proxy::handle_speech).layer(RequestBodyLimitLayer::new(proxy::SPEECH_BODY_LIMIT)),
         )
         .route("/v1/models", get(proxy::handle_models))
         .route("/models", get(proxy::handle_models))
-        .route(
-            "/v1/web-search",
-            post(proxy::handle_json)
-                .layer(RequestBodyLimitLayer::new(proxy::WEB_SEARCH_BODY_LIMIT)),
-        )
-        .route(
-            "/web-search",
-            post(proxy::handle_json)
-                .layer(RequestBodyLimitLayer::new(proxy::WEB_SEARCH_BODY_LIMIT)),
-        )
         .route(
             "/v1/requests/query",
             post(proxy::handle_requests_query)
@@ -250,7 +243,7 @@ async fn record_response_transport(
     };
     let mut parts = parts;
     parts.headers.insert(
-        "x-deepseek-lb-request-id",
+        "x-qwen-lb-request-id",
         axum::http::HeaderValue::from_str(&id.request_id)
             .expect("request IDs are valid header values"),
     );
@@ -313,7 +306,7 @@ include!(concat!(env!("OUT_DIR"), "/embedded_assets_fingerprint.rs"));
 struct Assets;
 
 async fn static_asset(uri: axum::http::Uri) -> Response {
-    if ["/api", "/v1", "/backend-api"]
+    if ["/api", "/v1"]
         .iter()
         .any(|prefix| uri.path() == *prefix || uri.path().starts_with(&format!("{prefix}/")))
     {
@@ -343,6 +336,7 @@ async fn static_asset(uri: axum::http::Uri) -> Response {
                     Some("css") => "text/css",
                     Some("svg") => "image/svg+xml",
                     Some("woff2") => "font/woff2",
+                    Some("wav") => "audio/wav",
                     _ => "text/html; charset=utf-8",
                 }
             };
@@ -533,14 +527,21 @@ pub(crate) async fn test_state(upstream_base: &str) -> AppState {
         auth_issuer: None,
         auth_audience: None,
         upstream_base: upstream_base.to_owned(),
-        available_model_ids: config::default_available_model_ids(),
-        web_search_model: "deepseek-flash".to_owned(),
+        transcription_models: vec![config::TranscriptionModel {
+            model: config::DEFAULT_TRANSCRIPTION_MODEL.to_owned(),
+            price_usd_nanos_per_second: 30556,
+        }],
+        default_transcription_model: config::DEFAULT_TRANSCRIPTION_MODEL.to_owned(),
+        speech_models: vec![config::SpeechModel {
+            model: config::DEFAULT_SPEECH_MODEL.to_owned(),
+            price_usd_nanos_per_character: 11111,
+        }],
+        default_speech_model: config::DEFAULT_SPEECH_MODEL.to_owned(),
         allow_all_users_debt: false,
         response_body_limit: 1024 * 1024,
         affinity_ttl_seconds: 3600,
         provider_concurrency_limit: 3,
         request_archive_retention_days: 7,
-        model_price_multiplier_nanos: 1_000_000_000,
         midas_api_base: "http://midas.invalid/api".to_owned(),
         midas_fund_user_id: None,
         midas_fund_api_key: None,
@@ -560,7 +561,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unknown_api_namespace_returns_json_not_spa() {
         let state = crate::test_state("http://upstream.invalid").await;
-        for path in ["/api/missing", "/v1/missing", "/backend-api/missing"] {
+        for path in ["/api/missing", "/v1/missing"] {
             let response = crate::router(state.clone())
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
@@ -580,13 +581,13 @@ mod routing_tests {
     }
 
     #[tokio::test]
-    async fn consumer_endpoints_require_a_consumer_credential() {
+    async fn audio_endpoints_require_a_consumer_credential() {
         let state = crate::test_state("http://upstream.invalid").await;
         let mut request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"deepseek-flash","messages":[]}"#))
+            .uri("/v1/audio/transcriptions")
+            .header("content-type", "multipart/form-data; boundary=x")
+            .body(Body::from("--x--"))
             .unwrap();
         request
             .extensions_mut()

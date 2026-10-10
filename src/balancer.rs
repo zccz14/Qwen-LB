@@ -35,8 +35,7 @@ pub struct Provider {
     pub owner_id: Option<String>,
     /// [`PROVIDER_VISIBILITY_PUBLIC`] or [`PROVIDER_VISIBILITY_PRIVATE`].
     pub visibility: String,
-    pub official_provided_usd_nanos: i64,
-    pub actual_provided_usd_nanos: i64,
+    pub provided_usd_nanos: i64,
     #[serde(skip_serializing)]
     pub is_deleted: i64,
 }
@@ -200,7 +199,7 @@ impl Balancer {
                 let eligible = eligible_providers(&providers, excluded, downstream, now);
                 if eligible.is_empty() {
                     return Err(AppError::unavailable_with_reason(
-                        "no available DeepSeek provider",
+                        "no available Qwen provider",
                         "provider_pool_empty",
                     ));
                 }
@@ -559,7 +558,7 @@ pub async fn track_response(
     Ok(())
 }
 
-// ASSUMPTION: DeepSeek 429 responses carry no reset time, so a rejected request is treated as a
+// ASSUMPTION: Qwen 429 responses carry no reset time, so a rejected request is treated as a
 // short-lived saturation signal and the provider is cooled down for a fixed window before it is
 // eligible again. If the window is too short the provider simply receives another 429 and cools
 // down again; if it is too long other providers absorb the traffic in the meantime.

@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    convert::Infallible,
     net::SocketAddr,
     time::{Duration, Instant},
 };
@@ -8,11 +7,11 @@ use std::{
 use axum::{
     Json,
     body::{Body, Bytes},
-    extract::{ConnectInfo, Extension, OriginalUri, Path, State},
+    extract::{ConnectInfo, Extension, Multipart, Path, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version, header},
     response::{IntoResponse, Response},
 };
-use futures_util::StreamExt;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 use sqlx::{QueryBuilder, Row, Sqlite};
 use tokio::sync::OwnedSemaphorePermit;
@@ -25,96 +24,45 @@ use crate::{
     balancer::{Downstream, Lease, affinity_hash, track_response},
     crypto::consumer_secret_hash,
     midas,
-    pricing::{self, Usage},
-    web_search,
 };
 
-const HOP_HEADERS: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "host",
-    "content-length",
-    "cookie",
-    "proxy-connection",
-    "set-cookie",
-];
+/// Everything below the two voice endpoints speaks this one upstream surface:
+/// a single JSON POST that either transcribes an audio to text or synthesizes
+/// text to audio, exactly as the Qwen platform documents it.
+const GENERATION_PATH: &str = "/api/v1/services/aigc/multimodal-generation/generation";
 
-const PROXY_ONLY_HEADERS: &[&str] = &["x-lb-affinity-key"];
+pub(crate) const TRANSCRIPTION_PATH: &str = "/v1/audio/transcriptions";
+pub(crate) const SPEECH_PATH: &str = "/v1/audio/speech";
 
-struct CallContext {
-    model: Option<String>,
-    stream: bool,
-    /// Source bound of a `/v1/web-search` envelope; `None` for inference calls.
-    max_results: Option<usize>,
-}
+/// Request body cap for one transcription upload. The platform bills by audio
+/// seconds and recommends small inputs; 24 MiB comfortably fits a five-minute
+/// 16 kHz WAV while keeping the base64 payload and audit preview bounded.
+pub(crate) const TRANSCRIPTION_BODY_LIMIT: usize = 24 * 1024 * 1024;
+
+/// Request body cap for one speech synthesis; the body is a short text.
+pub(crate) const SPEECH_BODY_LIMIT: usize = 64 * 1024;
+
+/// Maximum request IDs accepted by one batch query.
+const REQUEST_QUERY_MAX_IDS: usize = 1000;
+
+/// Request body cap for batch queries; 1000 UUIDs fit in about 40 KiB.
+pub(crate) const REQUEST_QUERY_BODY_LIMIT: usize = 256 * 1024;
+
+/// The default voice when a speech request names none.
+const DEFAULT_SPEECH_VOICE: &str = "Cherry";
+
+/// How long a single-record query waits for a just-finished request to settle
+/// and persist before reporting the record as missing.
+const REQUEST_RECORD_WAIT: Duration = Duration::from_secs(2);
+
+/// Poll interval while waiting for a settlement row to appear.
+const REQUEST_RECORD_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 struct RequestAuditContext {
     request_id: String,
     thread_id: Option<String>,
     method: Method,
     client_ip: String,
-}
-
-/// Which DeepSeek endpoint a request is bound for.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Endpoint {
-    ChatCompletions,
-    Responses,
-    WebSearch,
-}
-
-impl Endpoint {
-    fn for_path(path: &str) -> Option<Self> {
-        match path {
-            "/v1/chat/completions" | "/chat/completions" => Some(Self::ChatCompletions),
-            "/v1/responses" | "/responses" => Some(Self::Responses),
-            "/v1/web-search" | "/web-search" => Some(Self::WebSearch),
-            _ => None,
-        }
-    }
-
-    /// Stored in the audit row so bare and `/v1`-prefixed routes share one identity.
-    fn audit_path(self) -> &'static str {
-        match self {
-            Self::ChatCompletions => "/v1/chat/completions",
-            Self::Responses => "/v1/responses",
-            Self::WebSearch => "/v1/web-search",
-        }
-    }
-
-    /// Appended to the configured upstream base URL.
-    fn upstream_suffix(self) -> &'static str {
-        match self {
-            Self::ChatCompletions => "/chat/completions",
-            Self::Responses => "/responses",
-            Self::WebSearch => web_search::MESSAGES_PATH,
-        }
-    }
-
-    /// Headers the upstream protocol requires beyond `Authorization`. The
-    /// Anthropic-compatible Messages endpoint agrees on a protocol version;
-    /// DeepSeek ignores the value, but the DSH search provider sends it and the
-    /// endpoint speaks a different protocol from the OpenAI-compatible pair.
-    fn protocol_headers(self) -> &'static [(&'static str, &'static str)] {
-        match self {
-            Self::ChatCompletions | Self::Responses => &[],
-            Self::WebSearch => &[("anthropic-version", web_search::ANTHROPIC_VERSION)],
-        }
-    }
-}
-
-struct ProxyRequest {
-    body: Bytes,
-    model: Option<String>,
-    stream: bool,
-    /// Source bound of a `/v1/web-search` envelope; `None` for inference calls.
-    max_results: Option<usize>,
 }
 
 struct AuditStart<'a> {
@@ -168,11 +116,19 @@ impl UpstreamResponse {
     }
 }
 
+/// What one settled call consumed, from the upstream's own usage report.
+#[derive(Clone, Copy, Default)]
+struct AudioUsage {
+    audio_seconds: f64,
+    characters: i64,
+    cost_usd_nanos: i64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AuditTransportId {
     /// `api_calls.id`, used internally for transport accounting.
     pub id: String,
-    /// `api_calls.request_id`, echoed as `x-deepseek-lb-request-id`.
+    /// `api_calls.request_id`, echoed as `x-qwen-lb-request-id`.
     pub request_id: String,
     pub diagnostics_enabled: bool,
 }
@@ -206,8 +162,6 @@ impl AuditTracker {
             method: start.method.as_str().to_owned(),
             path: start.path.to_owned(),
             model: None,
-            reasoning_effort: None,
-            peak: false,
             status: 0,
             upstream_http_version: None,
             first_byte_latency_ms: None,
@@ -220,12 +174,9 @@ impl AuditTracker {
             upstream_accept_encoding: None,
             upstream_content_encoding: None,
             latency_ms: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            cached_tokens: 0,
-            official_cost_usd_nanos: 0,
-            actual_cost_usd_nanos: 0,
-            price_multiplier_nanos: state.config.load().model_price_multiplier_nanos,
+            audio_seconds: 0.0,
+            characters: 0,
+            cost_usd_nanos: 0,
             error: None,
             error_code: None,
             client_ip: start.client_ip.to_owned(),
@@ -266,12 +217,6 @@ impl AuditTracker {
         }
     }
 
-    fn set_reasoning_effort(&mut self, effort: Option<&str>) {
-        if let Some(event) = &mut self.event {
-            event.reasoning_effort = effort.map(str::to_owned);
-        }
-    }
-
     fn set_request(&mut self, headers: &HeaderMap, body: &[u8], truncated: bool) {
         if let Some(event) = &mut self.event {
             if !event.request_archive {
@@ -296,10 +241,9 @@ impl AuditTracker {
         }
     }
 
-    fn set_upstream_accept_encoding(&mut self, headers: &HeaderMap) {
+    fn set_upstream_accept_encoding(&mut self) {
         if let Some(event) = &mut self.event {
-            event.upstream_accept_encoding = header_value(headers, header::ACCEPT_ENCODING)
-                .or_else(|| Some("auto (gzip, br, zstd, deflate)".to_owned()));
+            event.upstream_accept_encoding = Some("auto (gzip, br, zstd, deflate)".to_owned());
         }
     }
 
@@ -369,23 +313,6 @@ impl AuditTracker {
         }
     }
 
-    fn inspect_sse_body(&mut self, bytes: &[u8]) -> Usage {
-        let mut observation = SseObservation::default();
-        observation.capture(bytes);
-        if let (Some(event), Some(failure)) = (&mut self.event, observation.failure) {
-            event.error_code = failure.code;
-            event.error = Some(failure.message);
-        }
-        observation.usage
-    }
-
-    fn inspect_json_body(&mut self, bytes: &[u8]) -> Usage {
-        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
-            return Usage::default();
-        };
-        usage_from_value(&value)
-    }
-
     fn set_error_response(&mut self, error: &AppError) {
         let body = serde_json::to_vec(&json!({"error":{
             "message":error.message(),
@@ -408,7 +335,7 @@ impl AuditTracker {
         &mut self,
         status: StatusCode,
         model: Option<&str>,
-        usage: Usage,
+        usage: AudioUsage,
         error: Option<&str>,
     ) -> Option<AuditTransportId> {
         let mut event = self.event.take()?;
@@ -431,19 +358,6 @@ impl AuditTracker {
             .send(event, self.archive_budget.take());
         Some(transport)
     }
-
-    fn take_stream(&mut self, status: StatusCode, model: Option<&str>) -> StreamCompletion {
-        if let Some(event) = &mut self.event {
-            event.status = status.as_u16() as i64;
-            event.model = model.map(str::to_owned);
-        }
-        StreamCompletion::new(
-            self.permit.take(),
-            self.archive_budget.take(),
-            self.event.take(),
-            self.started,
-        )
-    }
 }
 
 impl Drop for AuditTracker {
@@ -454,7 +368,7 @@ impl Drop for AuditTracker {
                 &mut event,
                 499,
                 None,
-                Usage::default(),
+                AudioUsage::default(),
                 Some("client_cancelled"),
                 self.started,
             );
@@ -470,50 +384,332 @@ fn settle(
     event: &mut AuditEvent,
     status: i64,
     model: Option<&str>,
-    usage: Usage,
+    usage: AudioUsage,
     error: Option<&str>,
     started: Instant,
 ) {
     event.status = status;
     event.model = model.map(str::to_owned).or_else(|| event.model.take());
     event.latency_ms = started.elapsed().as_millis().max(1) as i64;
-    event.input_tokens = usage.input_tokens;
-    event.output_tokens = usage.output_tokens;
-    event.cached_tokens = usage.cached_tokens;
-    event.peak = pricing::is_peak(event.created_at);
-    event.official_cost_usd_nanos = model
-        .and_then(|model| pricing::official_cost_usd_nanos(model, usage, event.peak))
-        .unwrap_or_default();
-    event.actual_cost_usd_nanos = pricing::apply_price_multiplier(
-        event.official_cost_usd_nanos,
-        event.price_multiplier_nanos,
-    );
+    event.audio_seconds = usage.audio_seconds;
+    event.characters = usage.characters;
+    event.cost_usd_nanos = usage.cost_usd_nanos.max(0);
     if event.error.is_none() {
         event.error = error.map(str::to_owned);
     }
 }
 
-pub async fn handle_json(
+/// One transcription upload, parsed out of the multipart body.
+struct Upload {
+    bytes: Bytes,
+    content_type: Option<String>,
+    filename: Option<String>,
+    model: Option<String>,
+    language: Option<String>,
+}
+
+async fn read_upload(mut multipart: Multipart) -> Result<Upload, AppError> {
+    let mut upload = Upload {
+        bytes: Bytes::new(),
+        content_type: None,
+        filename: None,
+        model: None,
+        language: None,
+    };
+    let mut has_file = false;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| AppError::bad_request(format!("invalid multipart body: {error}")))?
+    {
+        let name = field.name().unwrap_or_default().to_owned();
+        match name.as_str() {
+            "file" if !has_file => {
+                upload.content_type = field.content_type().map(str::to_owned);
+                upload.filename = field.file_name().map(str::to_owned);
+                upload.bytes = field.bytes().await.map_err(|error| {
+                    AppError::bad_request(format!("failed to read audio: {error}"))
+                })?;
+                has_file = true;
+            }
+            "model" => upload.model = Some(read_field_text(field).await?),
+            "language" => upload.language = Some(read_field_text(field).await?),
+            _ => {
+                let _ = field.bytes().await;
+            }
+        }
+    }
+    if !has_file || upload.bytes.is_empty() {
+        return Err(AppError::bad_request("a non-empty file field is required"));
+    }
+    Ok(upload)
+}
+
+async fn read_field_text(field: axum::extract::multipart::Field<'_>) -> Result<String, AppError> {
+    field
+        .text()
+        .await
+        .map_err(|error| AppError::bad_request(format!("invalid multipart field: {error}")))
+}
+
+/// Maps the uploaded file to the platform's audio `format` value, preferring
+/// the declared MIME type and falling back to the file name extension.
+fn audio_format(
+    content_type: Option<&str>,
+    filename: Option<&str>,
+) -> Result<&'static str, AppError> {
+    if let Some(mime) = content_type {
+        let mime = mime
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let mapped = match mime.as_str() {
+            "audio/wav" | "audio/x-wav" | "audio/wave" => Some("wav"),
+            "audio/mpeg" | "audio/mp3" => Some("mp3"),
+            "audio/mp4" => Some("mp4"),
+            "audio/x-m4a" | "audio/m4a" => Some("m4a"),
+            "audio/ogg" => Some("ogg"),
+            "audio/opus" => Some("opus"),
+            "audio/webm" => Some("webm"),
+            "audio/flac" | "audio/x-flac" => Some("flac"),
+            "audio/aac" => Some("aac"),
+            "audio/amr" => Some("amr"),
+            "audio/x-ms-wma" | "audio/wma" => Some("wma"),
+            _ => None,
+        };
+        if let Some(format) = mapped {
+            return Ok(format);
+        }
+    }
+    if let Some(filename) = filename
+        && let Some(extension) = filename.rsplit('.').next()
+    {
+        let mapped = match extension.to_ascii_lowercase().as_str() {
+            "wav" => Some("wav"),
+            "mp3" | "mpeg" => Some("mp3"),
+            "mp4" => Some("mp4"),
+            "m4a" => Some("m4a"),
+            "ogg" => Some("ogg"),
+            "opus" => Some("opus"),
+            "webm" => Some("webm"),
+            "flac" => Some("flac"),
+            "aac" => Some("aac"),
+            "amr" => Some("amr"),
+            "wma" => Some("wma"),
+            "mkv" => Some("mkv"),
+            "mov" => Some("mov"),
+            "avi" => Some("avi"),
+            "flv" => Some("flv"),
+            "wmv" => Some("wmv"),
+            _ => None,
+        };
+        if let Some(format) = mapped {
+            return Ok(format);
+        }
+    }
+    Err(AppError::bad_request(
+        "unsupported audio format: declare an audio/* MIME type or use a common audio extension",
+    ))
+}
+
+/// The MIME type carried in the base64 data URI; the declared type wins, and
+/// otherwise the derived format picks a canonical one.
+fn audio_mime(content_type: Option<&str>, format: &str) -> String {
+    if let Some(content_type) = content_type {
+        let mime = content_type.split(';').next().unwrap_or_default().trim();
+        if mime.to_ascii_lowercase().starts_with("audio/") {
+            return mime.to_ascii_lowercase();
+        }
+    }
+    match format {
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "mp4" => "audio/mp4",
+        "m4a" => "audio/x-m4a",
+        "ogg" => "audio/ogg",
+        "opus" => "audio/opus",
+        "webm" => "audio/webm",
+        "flac" => "audio/flac",
+        "aac" => "audio/aac",
+        "amr" => "audio/amr",
+        "wma" => "audio/x-ms-wma",
+        _ => "application/octet-stream",
+    }
+    .to_owned()
+}
+
+fn build_transcription_body(
+    model: &str,
+    format: &str,
+    language: Option<&str>,
+    mime: &str,
+    audio: &[u8],
+) -> Vec<u8> {
+    let data_uri = format!("data:{mime};base64,{}", BASE64.encode(audio));
+    let mut parameters = json!({"format": format});
+    if let Some(language) = language.filter(|language| !language.is_empty()) {
+        parameters["language_hints"] = json!([language]);
+    }
+    serde_json::to_vec(&json!({
+        "model": model,
+        "input": {"messages": [{
+            "role": "user",
+            "content": [{"type": "input_audio", "input_audio": {"data": data_uri}}],
+        }]},
+        "parameters": parameters,
+    }))
+    .expect("transcription request body is serializable")
+}
+
+pub async fn handle_transcription(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
-    body: Bytes,
+    multipart: Multipart,
 ) -> Result<Response, AppError> {
     let identity = api_identity(&state, &headers).await?;
-    let audit = RequestAuditContext {
+    let audit_context = RequestAuditContext {
         request_id: unified_request_id(&headers),
         thread_id: thread_id(&headers),
         method,
         client_ip: peer.ip().to_string(),
     };
-    dispatch(state, identity, audit, uri.path(), &headers, &body).await
+    dispatch_transcription(state, identity, audit_context, headers, multipart).await
 }
 
-/// `/api/web-search`: the console runs the same search the data plane runs, so
-/// operators can verify the wiring without a Consumer credential.
-pub async fn handle_console_web_search(
+/// The console speech-to-text tool: a signed-in browser transcribes audio on
+/// the same dispatch as the public `/v1/audio/transcriptions` endpoint.
+pub async fn handle_console_transcription(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(user): Extension<UserIdentity>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Result<Response, AppError> {
+    let identity = console_api_identity(&state, &user).await?;
+    let audit_context = RequestAuditContext {
+        request_id: unified_request_id(&headers),
+        thread_id: thread_id(&headers),
+        method: Method::POST,
+        client_ip: peer.ip().to_string(),
+    };
+    dispatch_transcription(state, identity, audit_context, headers, multipart).await
+}
+
+async fn dispatch_transcription(
+    state: AppState,
+    identity: ApiIdentity,
+    audit_context: RequestAuditContext,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Result<Response, AppError> {
+    let affinity_key = affinity_key(&headers);
+    let affinity = affinity_key
+        .as_ref()
+        .map(|key| format!("{}:{}", identity.consumer_id, key.value));
+    // INVARIANT: The audit row starts before validation so rejected requests stay visible.
+    let mut audit = AuditTracker::begin(
+        &state,
+        &identity,
+        AuditStart {
+            audit_id: &audit_context.request_id,
+            thread_id: audit_context.thread_id.as_deref(),
+            method: &audit_context.method,
+            path: TRANSCRIPTION_PATH,
+            client_ip: &audit_context.client_ip,
+            response_body_limit: ARCHIVE_BODY_LIMIT,
+        },
+    );
+    audit.set_affinity(
+        affinity.as_deref(),
+        affinity_key.as_ref().map(|key| key.source),
+    );
+    let result = async {
+        let upload = read_upload(multipart).await?;
+        let config = state.config.load_full();
+        let model = upload
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| config.default_transcription_model.clone());
+        let price_usd_nanos_per_second = config
+            .transcription_price_per_second(&model)
+            .ok_or_else(|| AppError::bad_request(format!("model is not available: {model}")))?;
+        let format = audio_format(upload.content_type.as_deref(), upload.filename.as_deref())?;
+        let language = match upload.language.as_deref().map(str::trim) {
+            None | Some("") | Some("auto") => None,
+            Some(language)
+                if language.len() <= 16
+                    && language
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') =>
+            {
+                Some(language.to_owned())
+            }
+            Some(_) => {
+                return Err(AppError::bad_request(
+                    "language must be a short language tag such as zh or en",
+                ));
+            }
+        };
+        audit.set_request(
+            &headers,
+            &upload.bytes,
+            upload.bytes.len() > ARCHIVE_BODY_LIMIT,
+        );
+        audit.set_request_size(upload.bytes.len() as i64);
+        audit.set_requested_model(Some(&model));
+        ensure_request_quota(&state, &identity.user_id, identity.allow_debt).await?;
+        let mime = audio_mime(upload.content_type.as_deref(), format);
+        let body =
+            build_transcription_body(&model, format, language.as_deref(), &mime, &upload.bytes);
+        let downstream = Downstream::new(&identity.user_id);
+        let routed = route_upstream(
+            &state,
+            &mut audit,
+            affinity.as_deref(),
+            downstream,
+            body.into(),
+        )
+        .await?;
+        relay_transcription(
+            routed.lease,
+            routed.upstream,
+            &model,
+            price_usd_nanos_per_second,
+            &mut audit,
+        )
+        .await
+    }
+    .await;
+    finish_audit_error(&mut audit, result)
+}
+
+pub async fn handle_speech(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let identity = api_identity(&state, &headers).await?;
+    let audit_context = RequestAuditContext {
+        request_id: unified_request_id(&headers),
+        thread_id: thread_id(&headers),
+        method,
+        client_ip: peer.ip().to_string(),
+    };
+    dispatch_speech(state, identity, audit_context, headers, body).await
+}
+
+/// The console text-to-speech tool: a signed-in browser synthesizes speech on
+/// the same dispatch as the public `/v1/audio/speech` endpoint.
+pub async fn handle_console_speech(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Extension(user): Extension<UserIdentity>,
@@ -521,27 +717,115 @@ pub async fn handle_console_web_search(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let identity = console_api_identity(&state, &user).await?;
-    let audit = RequestAuditContext {
+    let audit_context = RequestAuditContext {
         request_id: unified_request_id(&headers),
         thread_id: thread_id(&headers),
         method: Method::POST,
         client_ip: peer.ip().to_string(),
     };
-    // INVARIANT: The console enters the data plane through the canonical API
-    // path, so every search is described by one audit row shape.
-    dispatch(
-        state,
-        identity,
-        audit,
-        Endpoint::WebSearch.audit_path(),
-        &headers,
-        &body,
-    )
-    .await
+    dispatch_speech(state, identity, audit_context, headers, body).await
 }
 
-/// The caller's hidden console consumer: console searches are audited and
-/// billed like API calls, but without a credential the user has to paste.
+async fn dispatch_speech(
+    state: AppState,
+    identity: ApiIdentity,
+    audit_context: RequestAuditContext,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let affinity_key = affinity_key(&headers);
+    let affinity = affinity_key
+        .as_ref()
+        .map(|key| format!("{}:{}", identity.consumer_id, key.value));
+    // INVARIANT: The audit row starts before validation so rejected requests stay visible.
+    let mut audit = AuditTracker::begin(
+        &state,
+        &identity,
+        AuditStart {
+            audit_id: &audit_context.request_id,
+            thread_id: audit_context.thread_id.as_deref(),
+            method: &audit_context.method,
+            path: SPEECH_PATH,
+            client_ip: &audit_context.client_ip,
+            response_body_limit: ARCHIVE_BODY_LIMIT,
+        },
+    );
+    audit.set_affinity(
+        affinity.as_deref(),
+        affinity_key.as_ref().map(|key| key.source),
+    );
+    audit.set_request(&headers, &body, false);
+    audit.set_compression_headers(&headers, None);
+    audit.set_request_size(body.len() as i64);
+    let result = async {
+        let value = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .filter(Value::is_object)
+            .ok_or_else(|| AppError::bad_request("JSON object request body required"))?;
+        let input = value
+            .get("input")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|input| !input.is_empty())
+            .ok_or_else(|| AppError::bad_request("input must be a non-empty string"))?
+            .to_owned();
+        match value.get("response_format").and_then(Value::as_str) {
+            None | Some("wav") => {}
+            Some(other) => {
+                return Err(AppError::bad_request(format!(
+                    "unsupported response_format: {other}; only wav is available"
+                )));
+            }
+        }
+        let config = state.config.load_full();
+        let model = value
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| config.default_speech_model.clone());
+        let price_usd_nanos_per_character = config
+            .speech_price_per_character(&model)
+            .ok_or_else(|| AppError::bad_request(format!("model is not available: {model}")))?;
+        let voice = value
+            .get("voice")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|voice| !voice.is_empty())
+            .unwrap_or(DEFAULT_SPEECH_VOICE)
+            .to_owned();
+        audit.set_requested_model(Some(&model));
+        ensure_request_quota(&state, &identity.user_id, identity.allow_debt).await?;
+        let upstream_body = serde_json::to_vec(&json!({
+            "model": model,
+            "input": {"text": input, "voice": voice},
+        }))?;
+        let downstream = Downstream::new(&identity.user_id);
+        let routed = route_upstream(
+            &state,
+            &mut audit,
+            affinity.as_deref(),
+            downstream,
+            upstream_body.into(),
+        )
+        .await?;
+        relay_speech(
+            &state,
+            routed.lease,
+            routed.upstream,
+            &model,
+            price_usd_nanos_per_character,
+            &mut audit,
+        )
+        .await
+    }
+    .await;
+    finish_audit_error(&mut audit, result)
+}
+
+/// The caller's hidden console consumer: console calls are audited and billed
+/// like API calls, but without a credential the user has to paste.
 async fn console_api_identity(
     state: &AppState,
     user: &UserIdentity,
@@ -553,7 +837,7 @@ async fn console_api_identity(
         .await?
         != 0;
     let _write = state.write_gate.lock().await;
-    sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,request_archive,is_system,created_at) VALUES(?,?, 'DeepSeek-LB Console','console',?,1,1,?) ON CONFLICT(id) DO NOTHING")
+    sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,request_archive,is_system,created_at) VALUES(?,?, 'Qwen-LB Console','console',?,1,1,?) ON CONFLICT(id) DO NOTHING")
         .bind(&consumer_id)
         .bind(&user.id)
         .bind(consumer_secret_hash(&Uuid::new_v4().to_string()))
@@ -574,40 +858,38 @@ pub async fn handle_models(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     api_identity(&state, &headers).await?;
-    let config = state.config.load();
-    models_response(&config.available_model_ids)
+    let config = state.config.load_full();
+    let models = config
+        .transcription_models
+        .iter()
+        .map(|item| item.model.clone())
+        .chain(config.speech_models.iter().map(|item| item.model.clone()))
+        .collect::<Vec<_>>();
+    let body = serde_json::to_vec(
+        &json!({"object":"list","data":models.iter().map(|id| json!({"id":id,"object":"model","owned_by":"qwen"})).collect::<Vec<_>>() }),
+    )?;
+    build_response(
+        StatusCode::OK,
+        vec![(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        Body::from(body),
+    )
 }
-
-/// How long a single-record query waits for a just-finished request to settle
-/// and persist before reporting the record as missing.
-const REQUEST_RECORD_WAIT: Duration = Duration::from_secs(2);
-
-/// Poll interval while waiting for a settlement row to appear.
-const REQUEST_RECORD_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Maximum request IDs accepted by one batch query.
-const REQUEST_QUERY_MAX_IDS: usize = 1000;
-
-/// Request body cap for batch queries; 1000 UUIDs fit in about 40 KiB.
-pub(crate) const REQUEST_QUERY_BODY_LIMIT: usize = 256 * 1024;
-
-/// Request body cap for one web search; a query plus its bounds is tiny, and a
-/// search turn is charged for, so the cap stays far below an inference body.
-pub(crate) const WEB_SEARCH_BODY_LIMIT: usize = 64 * 1024;
 
 /// Column set shared by both query shapes; the response field names are fixed
 /// by [`request_record_json`].
-const REQUEST_RECORD_SELECT: &str = "SELECT request_id,status,model,input_tokens,output_tokens,cached_tokens,actual_cost_usd_nanos,created_at FROM api_calls";
+const REQUEST_RECORD_SELECT: &str = "SELECT request_id,status,model,audio_seconds,characters,cost_usd_nanos,created_at FROM api_calls";
 
 fn request_record_json(row: &sqlx::sqlite::SqliteRow) -> Value {
     json!({
         "request_id": row.get::<String, _>("request_id"),
         "status": row.get::<i64, _>("status"),
         "model": row.get::<Option<String>, _>("model"),
-        "input_tokens": row.get::<i64, _>("input_tokens"),
-        "output_tokens": row.get::<i64, _>("output_tokens"),
-        "cached_tokens": row.get::<i64, _>("cached_tokens"),
-        "cost_usd_nanos": row.get::<i64, _>("actual_cost_usd_nanos"),
+        "audio_seconds": row.get::<f64, _>("audio_seconds"),
+        "characters": row.get::<i64, _>("characters"),
+        "cost_usd_nanos": row.get::<i64, _>("cost_usd_nanos"),
         "created_at": row.get::<i64, _>("created_at"),
     })
 }
@@ -653,8 +935,8 @@ async fn wait_for_request_record(state: &AppState, id: &str) -> Result<Option<Va
     }
 }
 
-/// Cost record for one request, addressed by the `x-deepseek-lb-request-id`
-/// response header of the original inference call.
+/// Cost record for one request, addressed by the `x-qwen-lb-request-id`
+/// response header of the original call.
 pub async fn handle_request_record(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -663,8 +945,8 @@ pub async fn handle_request_record(
     api_identity(&state, &headers).await?;
     let Some(record) = wait_for_request_record(&state, &id).await? else {
         // The not-found answer doubles as this service's recognition probe:
-        // it names the load balancer so an upstream gateway can route web
-        // searches by source.
+        // it names the load balancer so an upstream gateway can learn where
+        // calls should route.
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({"error":{
@@ -672,7 +954,7 @@ pub async fn handle_request_record(
                 "type": "proxy_error",
                 "code": 404,
                 "reason": "request_not_found",
-                "lb": "deepseek",
+                "lb": "qwen",
             }})),
         )
             .into_response());
@@ -752,199 +1034,34 @@ async fn ensure_request_quota(
     })
 }
 
-async fn dispatch(
-    state: AppState,
-    identity: ApiIdentity,
-    audit_context: RequestAuditContext,
-    path: &str,
-    headers: &HeaderMap,
-    body: &Bytes,
-) -> Result<Response, AppError> {
-    let endpoint =
-        Endpoint::for_path(path).ok_or_else(|| AppError::not_found("API route not found"))?;
-    let parsed = serde_json::from_slice::<Value>(body).ok();
-    let affinity_key = affinity_key(headers);
-    let affinity = affinity_key
-        .as_ref()
-        .map(|key| format!("{}:{}", identity.consumer_id, key.value));
-    // INVARIANT: The audit row starts before validation so rejected requests stay visible.
-    let mut audit = begin_request_audit(&state, &identity, &audit_context, endpoint, headers, body);
-    audit.set_affinity(
-        affinity.as_deref(),
-        affinity_key.as_ref().map(|key| key.source),
-    );
-    let result = async {
-        let request = prepare_request(endpoint, parsed, &state)?;
-        ensure_request_quota(&state, &identity.user_id, identity.allow_debt).await?;
-        let downstream = Downstream::new(&identity.user_id);
-        let (lease, upstream) = dispatch_to_provider(
-            &state,
-            endpoint,
-            headers,
-            &request,
-            affinity.as_deref(),
-            &mut audit,
-            downstream,
-        )
-        .await?;
-        let context = CallContext {
-            model: request.model.clone(),
-            stream: request.stream,
-            max_results: request.max_results,
-        };
-        match endpoint {
-            Endpoint::WebSearch => {
-                web_search_response(&state, context, lease, upstream, &mut audit).await
-            }
-            Endpoint::ChatCompletions | Endpoint::Responses => {
-                relay_response(&state, context, lease, upstream, &mut audit).await
-            }
-        }
-    }
-    .await;
-    finish_audit_error(&mut audit, result)
+struct RoutedUpstream {
+    lease: Lease,
+    upstream: UpstreamResponse,
 }
 
-fn prepare_request(
-    endpoint: Endpoint,
-    parsed: Option<Value>,
+/// Selects a provider, sends one upstream call, and retries once on another
+/// provider when the first answer is a retryable failure. The JSON body is
+/// rebuilt from memory on the retry, so the same audio bytes are replayed.
+async fn route_upstream(
     state: &AppState,
-) -> Result<ProxyRequest, AppError> {
-    let value = parsed.ok_or_else(|| AppError::bad_request("JSON request body required"))?;
-    if !value.is_object() {
-        return Err(AppError::bad_request("JSON object required"));
-    }
-    if endpoint == Endpoint::WebSearch {
-        return prepare_web_search_request(&value, state);
-    }
-    let model = value
-        .get("model")
-        .map(|model| {
-            model
-                .as_str()
-                .filter(|model| !model.is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| AppError::bad_request("model must be a non-empty string"))
-        })
-        .transpose()?
-        .ok_or_else(|| AppError::bad_request("model is required"))?;
-    ensure_model_is_available(state, &model)?;
-    let stream = value
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or_default();
-    let _ = endpoint;
-    Ok(ProxyRequest {
-        body: serde_json::to_vec(&value)?.into(),
-        model: Some(model),
-        stream,
-        max_results: None,
-    })
-}
-
-/// Translate one `/v1/web-search` body into the Anthropic-compatible Messages
-/// request that runs the search on the host model.
-///
-/// The endpoint takes a query and search controls, never a model:
-/// `web_search_model` is a deployment setting, so a caller cannot steer which
-/// model — and which price — serves the search turn.
-fn prepare_web_search_request(value: &Value, state: &AppState) -> Result<ProxyRequest, AppError> {
-    let search = web_search::search_request_from_json(value)?;
-    let model = state.config.load().web_search_model.clone();
-    Ok(ProxyRequest {
-        body: serde_json::to_vec(&web_search::request_body(&model, &search))?.into(),
-        model: Some(model),
-        stream: false,
-        max_results: Some(search.options.max_results),
-    })
-}
-
-fn begin_request_audit(
-    state: &AppState,
-    identity: &ApiIdentity,
-    context: &RequestAuditContext,
-    endpoint: Endpoint,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> AuditTracker {
-    let mut audit = AuditTracker::begin(
-        state,
-        identity,
-        AuditStart {
-            audit_id: &context.request_id,
-            thread_id: context.thread_id.as_deref(),
-            method: &context.method,
-            path: endpoint.audit_path(),
-            client_ip: &context.client_ip,
-            response_body_limit: ARCHIVE_BODY_LIMIT,
-        },
-    );
-    audit.set_request(headers, body, false);
-    audit.set_compression_headers(headers, None);
-    audit.set_request_size(body.len() as i64);
-    let request_json = serde_json::from_slice::<Value>(body).ok();
-    audit.set_reasoning_effort(request_json.as_ref().and_then(reasoning_effort).as_deref());
-    audit.set_requested_model(
-        request_json
-            .as_ref()
-            .and_then(|value| value.get("model"))
-            .and_then(Value::as_str),
-    );
-    audit
-}
-
-fn finish_audit_error<T>(
     audit: &mut AuditTracker,
-    result: Result<T, AppError>,
-) -> Result<T, AppError> {
-    result.map_err(|error| {
-        let reason = error.reason().map(str::to_owned);
-        if let (Some(reason), Some(event)) = (reason, audit.event.as_mut()) {
-            event.error_code = Some(reason);
-        }
-        if audit.event.is_none() {
-            return error;
-        }
-        audit.set_error_response(&error);
-        let audit_transport = audit
-            .finish(
-                error.status(),
-                None,
-                Usage::default(),
-                Some(error.message()),
-            )
-            .expect("an active audit event always has a transport ID");
-        error.with_audit_transport(audit_transport)
-    })
-}
-
-async fn dispatch_to_provider(
-    state: &AppState,
-    endpoint: Endpoint,
-    headers: &HeaderMap,
-    request: &ProxyRequest,
     affinity: Option<&str>,
-    audit: &mut AuditTracker,
     downstream: Downstream<'_>,
-) -> Result<(Lease, UpstreamResponse), AppError> {
+    body: Bytes,
+) -> Result<RoutedUpstream, AppError> {
     let mut first = state
         .balancer
         .select(state, affinity, None, downstream)
         .await?;
     audit.set_provider(&first);
     let first_id = first.provider.id.clone();
-    let response = send_upstream(
-        state,
-        &first,
-        endpoint,
-        headers,
-        request.body.clone().into(),
-        audit,
-    )
-    .await?;
+    let response = send_upstream(state, &first, body.clone().into(), audit).await?;
     let response = track_upstream(state, &first_id, UpstreamResponse::Live(response)).await?;
     if !retryable(response.status()) {
-        return Ok((first, response));
+        return Ok(RoutedUpstream {
+            lease: first,
+            upstream: response,
+        });
     }
     let response = finish_retry_attempt(&mut first, response).await?;
     let second = state
@@ -953,35 +1070,25 @@ async fn dispatch_to_provider(
         .await
         .ok();
     let Some(second) = second else {
-        return Ok((first, response));
+        return Ok(RoutedUpstream {
+            lease: first,
+            upstream: response,
+        });
     };
     drop(response);
     drop(first);
     audit.set_provider(&second);
-    let second_response = send_upstream(
-        state,
-        &second,
-        endpoint,
-        headers,
-        request.body.clone().into(),
-        audit,
-    )
-    .await?;
+    let second_response = send_upstream(state, &second, body.into(), audit).await?;
     let second_response = track_upstream(
         state,
         &second.provider.id,
         UpstreamResponse::Live(second_response),
     )
     .await?;
-    Ok((second, second_response))
-}
-
-fn reasoning_effort(request: &Value) -> Option<String> {
-    request
-        .pointer("/reasoning/effort")
-        .and_then(Value::as_str)
-        .or_else(|| request.get("reasoning_effort").and_then(Value::as_str))
-        .map(str::to_owned)
+    Ok(RoutedUpstream {
+        lease: second,
+        upstream: second_response,
+    })
 }
 
 async fn finish_retry_attempt(
@@ -1011,7 +1118,7 @@ fn affinity_key(headers: &HeaderMap) -> Option<AffinityKey> {
     [
         ("x-lb-affinity-key", "x-lb-affinity-key"),
         ("thread-id", "thread-id"),
-        ("x-deepseek-session-id", "x-deepseek-session-id"),
+        ("x-qwen-session-id", "x-qwen-session-id"),
         ("session-id", "session-id"),
     ]
     .iter()
@@ -1031,29 +1138,21 @@ fn affinity_key(headers: &HeaderMap) -> Option<AffinityKey> {
 async fn send_upstream(
     state: &AppState,
     lease: &Lease,
-    endpoint: Endpoint,
-    inbound: &HeaderMap,
     body: reqwest::Body,
     audit: &mut AuditTracker,
 ) -> Result<reqwest::Response, AppError> {
-    let mut request = state.client.post(format!(
-        "{}{}",
-        state.config.load().upstream_base,
-        endpoint.upstream_suffix()
-    ));
-    for (name, value) in inbound {
-        if should_forward_request_header(name) {
-            request = request.header(name, value);
-        }
-    }
-    audit.set_upstream_accept_encoding(inbound);
-    request = request
+    let request = state
+        .client
+        .post(format!(
+            "{}{}",
+            state.config.load().upstream_base,
+            GENERATION_PATH
+        ))
         .header(header::AUTHORIZATION, format!("Bearer {}", lease.api_key))
-        .header(header::CONTENT_TYPE, "application/json");
-    for (name, value) in endpoint.protocol_headers() {
-        request = request.header(*name, *value);
-    }
-    let request = request.body(body).build()?;
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .build()?;
+    audit.set_upstream_accept_encoding();
     audit.set_upstream_request_headers(request.headers());
     Ok(state.client.execute(request).await?)
 }
@@ -1063,17 +1162,6 @@ fn header_value(headers: &HeaderMap, name: HeaderName) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
-}
-
-fn should_forward_request_header(name: &HeaderName) -> bool {
-    let lower = name.as_str().to_ascii_lowercase();
-    if lower == "authorization"
-        || HOP_HEADERS.contains(&lower.as_str())
-        || PROXY_ONLY_HEADERS.contains(&lower.as_str())
-    {
-        return false;
-    }
-    matches!(lower.as_str(), "accept" | "accept-encoding" | "user-agent")
 }
 
 fn retryable(status: StatusCode) -> bool {
@@ -1103,145 +1191,151 @@ async fn track_upstream(
     Ok(UpstreamResponse::Buffered(buffered))
 }
 
-async fn relay_response(
-    state: &AppState,
-    context: CallContext,
-    lease: Lease,
+async fn relay_transcription(
+    _lease: Lease,
     upstream: UpstreamResponse,
+    model: &str,
+    price_usd_nanos_per_second: i64,
     audit: &mut AuditTracker,
 ) -> Result<Response, AppError> {
-    let _ = state;
     audit.mark_first_byte();
     let status = upstream.status();
     audit.set_upstream_http_version(upstream.version());
     audit.set_compression_headers(&HeaderMap::new(), Some(upstream.headers()));
     audit.set_response_headers(upstream.headers());
-    let mut headers = filtered_response_headers(upstream.headers());
-    let is_sse = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
-        });
-    let is_stream =
-        context.stream && status.is_success() && matches!(&upstream, UpstreamResponse::Live(_));
-    if !is_stream {
-        let bytes = upstream.into_bytes().await?;
+    let bytes = upstream.into_bytes().await?;
+    if !status.is_success() {
         audit.set_response_size(bytes.len() as i64);
         audit.set_response_body(&bytes, false);
-        let usage = if is_sse {
-            audit.inspect_sse_body(&bytes)
-        } else {
-            audit.inspect_json_body(&bytes)
-        };
         let audit_id = audit.finish(
             status,
-            context.model.as_deref(),
-            usage,
+            Some(model),
+            AudioUsage::default(),
             error_from(status, &bytes).as_deref(),
         );
-        let mut response = build_response(status, headers, Body::from(bytes))?;
+        let mut response = build_response(status, json_headers(), Body::from(bytes))?;
         if let Some(id) = audit_id {
             response.extensions_mut().insert(id);
         }
         return Ok(response);
     }
-    if !headers.iter().any(|(name, _)| name == header::CONTENT_TYPE) {
-        headers.push((
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/event-stream"),
-        ));
-    }
-    let audit_id = audit.event.as_ref().map(|event| AuditTransportId {
-        id: event.id.clone(),
-        request_id: event.request_id.clone(),
-        diagnostics_enabled: event.request_archive,
-    });
-    let completion = audit.take_stream(status, context.model.as_deref());
-    let UpstreamResponse::Live(upstream) = upstream else {
-        unreachable!("only successful live upstream responses stream")
-    };
-    let mut stream = upstream.bytes_stream();
-    let output = async_stream::stream! {
-        let mut completion = completion;
-        let mut stream_failed = false;
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(bytes) => {
-                    completion.capture_sse(&bytes);
-                    yield Ok::<Bytes, Infallible>(bytes);
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "upstream stream ended with error");
-                    stream_failed = true;
-                    break;
-                }
-            }
-        }
-        completion.finish(stream_failed);
-        drop(lease);
-    };
-    let mut response = build_response(status, headers, Body::from_stream(output))?;
+    let value = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|_| AppError::upstream(502, "transcription response was not JSON"))?;
+    let text = value
+        .pointer("/output/text")
+        .or_else(|| value.get("text"))
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| AppError::upstream(502, "transcription response is missing text"))?;
+    let audio_seconds = value
+        .pointer("/usage/duration")
+        .and_then(Value::as_f64)
+        .unwrap_or_default();
+    let cost_usd_nanos = (price_usd_nanos_per_second as f64 * audio_seconds).round() as i64;
+    let envelope = serde_json::to_vec(&json!({"text": text}))?;
+    audit.set_response_size(envelope.len() as i64);
+    audit.set_response_body(&envelope, false);
+    let audit_id = audit.finish(
+        StatusCode::OK,
+        Some(model),
+        AudioUsage {
+            audio_seconds,
+            characters: 0,
+            cost_usd_nanos,
+        },
+        None,
+    );
+    let mut response = build_response(StatusCode::OK, json_headers(), Body::from(envelope))?;
     if let Some(id) = audit_id {
         response.extensions_mut().insert(id);
     }
     Ok(response)
 }
 
-/// Answer a `/v1/web-search` call with its normalized sources and the token
-/// usage of the search turn. Failures keep the upstream status and body, which
-/// is where DeepSeek explains what went wrong with the turn.
-async fn web_search_response(
+async fn relay_speech(
     state: &AppState,
-    context: CallContext,
-    lease: Lease,
+    _lease: Lease,
     upstream: UpstreamResponse,
+    model: &str,
+    price_usd_nanos_per_character: i64,
     audit: &mut AuditTracker,
 ) -> Result<Response, AppError> {
-    let status = upstream.status();
-    if !status.is_success() {
-        return relay_response(state, context, lease, upstream, audit).await;
-    }
     audit.mark_first_byte();
+    let status = upstream.status();
     audit.set_upstream_http_version(upstream.version());
+    audit.set_compression_headers(&HeaderMap::new(), Some(upstream.headers()));
     audit.set_response_headers(upstream.headers());
     let bytes = upstream.into_bytes().await?;
-    let turn = serde_json::from_slice::<Value>(&bytes).map_err(|_| {
-        AppError::upstream(
+    if !status.is_success() {
+        audit.set_response_size(bytes.len() as i64);
+        audit.set_response_body(&bytes, false);
+        let audit_id = audit.finish(
+            status,
+            Some(model),
+            AudioUsage::default(),
+            error_from(status, &bytes).as_deref(),
+        );
+        let mut response = build_response(status, json_headers(), Body::from(bytes))?;
+        if let Some(id) = audit_id {
+            response.extensions_mut().insert(id);
+        }
+        return Ok(response);
+    }
+    let value = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|_| AppError::upstream(502, "speech response was not JSON"))?;
+    let audio_url = value
+        .pointer("/output/audio/url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| AppError::upstream(502, "speech response is missing audio"))?;
+    let characters = value
+        .pointer("/usage/characters")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let cost_usd_nanos = price_usd_nanos_per_character.saturating_mul(characters);
+    let audio = state
+        .client
+        .get(audio_url)
+        .send()
+        .await
+        .map_err(|_| AppError::upstream(502, "failed to download synthesized audio"))?;
+    let audio_status = audio.status();
+    if !audio_status.is_success() {
+        return Err(AppError::upstream(
             502,
-            "Web search failed: the DeepSeek response body was not JSON.",
-        )
-    })?;
-    let (sources, truncated) = web_search::sources_from_response(
-        &turn,
-        context
-            .max_results
-            .unwrap_or(web_search::DEFAULT_MAX_RESULTS),
-    )?;
-    let usage = web_search::usage_from_response(&turn);
-    let model = context.model.as_deref();
-    let envelope = serde_json::to_vec(&json!({
-        "created": chrono::Utc::now().timestamp(),
-        "model": model,
-        "queries": web_search::queries_from_response(&turn),
-        "sources": sources,
-        "truncated": truncated,
-        "usage": usage,
-    }))?;
-    audit.set_response_size(envelope.len() as i64);
-    audit.set_response_body(&envelope, false);
-    let audit_id = audit.finish(StatusCode::OK, model, usage, None);
+            format!("audio download failed with HTTP {}", audio_status.as_u16()),
+        ));
+    }
+    let content_type = audio
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "audio/wav".to_owned());
+    let audio_bytes = audio
+        .bytes()
+        .await
+        .map_err(|_| AppError::upstream(502, "failed to read synthesized audio"))?;
+    audit.set_response_size(audio_bytes.len() as i64);
+    audit.set_response_body(&audio_bytes, false);
+    let audit_id = audit.finish(
+        StatusCode::OK,
+        Some(model),
+        AudioUsage {
+            audio_seconds: 0.0,
+            characters,
+            cost_usd_nanos,
+        },
+        None,
+    );
     let mut response = build_response(
         StatusCode::OK,
         vec![(
             header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
+            HeaderValue::from_str(&content_type)
+                .map_err(|_| AppError::internal("upstream returned an invalid content type"))?,
         )],
-        Body::from(envelope),
+        Body::from(audio_bytes),
     )?;
     if let Some(id) = audit_id {
         response.extensions_mut().insert(id);
@@ -1249,106 +1343,29 @@ async fn web_search_response(
     Ok(response)
 }
 
-fn filtered_response_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
-    headers
-        .iter()
-        .filter(|(name, _)| {
-            let lower = name.as_str().to_ascii_lowercase();
-            !HOP_HEADERS.contains(&lower.as_str()) && lower != "x-request-id"
-        })
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect()
-}
-
-struct StreamCompletion {
-    permit: Option<AuditReservation>,
-    archive_budget: Option<OwnedSemaphorePermit>,
-    event: Option<AuditEvent>,
-    started: Instant,
-    response_preview: StreamingPreview,
-    response_bytes: i64,
-    sse: SseObservation,
-}
-
-impl StreamCompletion {
-    fn new(
-        permit: Option<AuditReservation>,
-        archive_budget: Option<OwnedSemaphorePermit>,
-        event: Option<AuditEvent>,
-        started: Instant,
-    ) -> Self {
-        Self {
-            permit,
-            archive_budget,
-            event,
-            started,
-            response_preview: StreamingPreview::default(),
-            response_bytes: 0,
-            sse: SseObservation::default(),
+fn finish_audit_error<T>(
+    audit: &mut AuditTracker,
+    result: Result<T, AppError>,
+) -> Result<T, AppError> {
+    result.map_err(|error| {
+        let reason = error.reason().map(str::to_owned);
+        if let (Some(reason), Some(event)) = (reason, audit.event.as_mut()) {
+            event.error_code = Some(reason);
         }
-    }
-
-    fn capture_sse(&mut self, bytes: &[u8]) {
-        let Some(request_archive) = self.event.as_ref().map(|event| event.request_archive) else {
-            return;
-        };
-        self.response_bytes += bytes.len() as i64;
-        self.sse.capture(bytes);
-        if let (Some(event), Some(failure)) = (&mut self.event, &self.sse.failure) {
-            event.error_code = failure.code.clone();
-            event.error = Some(failure.message.clone());
+        if audit.event.is_none() {
+            return error;
         }
-        if request_archive {
-            self.response_preview.capture(bytes);
-        }
-    }
-
-    fn finish(&mut self, failed: bool) {
-        let Some(mut event) = self.event.take() else {
-            return;
-        };
-        let status = if failed { 502 } else { event.status };
-        let error = failed.then_some("upstream_stream_error");
-        let model = event.model.clone();
-        event.response_body = Some(std::mem::take(&mut self.response_preview.body));
-        event.response_body_truncated = self.response_preview.truncated || failed;
-        event.response_bytes = self.response_bytes;
-        settle(
-            &mut event,
-            status,
-            model.as_deref(),
-            self.sse.usage,
-            error,
-            self.started,
-        );
-        self.permit
-            .take()
-            .expect("audit queue capacity is reserved once")
-            .send(event, self.archive_budget.take());
-    }
-}
-
-impl Drop for StreamCompletion {
-    fn drop(&mut self) {
-        if let Some(mut event) = self.event.take() {
-            let model = event.model.clone();
-            event.response_body = Some(std::mem::take(&mut self.response_preview.body));
-            event.response_body_truncated = true;
-            event.response_bytes = self.response_bytes;
-            settle(
-                &mut event,
-                499,
-                model.as_deref(),
-                self.sse.usage,
-                Some("client_cancelled"),
-                self.started,
-            );
-            self.permit
-                .take()
-                .expect("audit queue capacity is reserved once")
-                .send(event, self.archive_budget.take());
-        }
-    }
+        audit.set_error_response(&error);
+        let audit_transport = audit
+            .finish(
+                error.status(),
+                None,
+                AudioUsage::default(),
+                Some(error.message()),
+            )
+            .expect("an active audit event always has a transport ID");
+        error.with_audit_transport(audit_transport)
+    })
 }
 
 fn build_response(
@@ -1365,42 +1382,11 @@ fn build_response(
         .map_err(|_| AppError::internal("failed to build response"))
 }
 
-fn usage_from_value(value: &Value) -> Usage {
-    let usage = value
-        .get("usage")
-        .or_else(|| value.pointer("/response/usage"));
-    let Some(usage) = usage else {
-        return Usage::default();
-    };
-    let input_tokens = usage
-        .get("input_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| usage.get("prompt_tokens").and_then(Value::as_i64))
-        .unwrap_or_default();
-    let output_tokens = usage
-        .get("output_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| usage.get("completion_tokens").and_then(Value::as_i64))
-        .unwrap_or_default();
-    let cached_tokens = usage
-        .get("prompt_cache_hit_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| {
-            usage
-                .pointer("/input_tokens_details/cached_tokens")
-                .and_then(Value::as_i64)
-        })
-        .or_else(|| {
-            usage
-                .pointer("/prompt_tokens_details/cached_tokens")
-                .and_then(Value::as_i64)
-        })
-        .unwrap_or_default();
-    Usage {
-        input_tokens,
-        output_tokens,
-        cached_tokens,
-    }
+fn json_headers() -> Vec<(HeaderName, HeaderValue)> {
+    vec![(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    )]
 }
 
 fn body_preview(body: &[u8], limit: usize) -> (Vec<u8>, bool) {
@@ -1422,23 +1408,8 @@ pub(crate) fn archive_headers(headers: &HeaderMap) -> String {
     serde_json::to_string(&values).expect("HTTP headers are serializable")
 }
 
-#[derive(Default)]
-struct StreamingPreview {
-    body: Vec<u8>,
-    truncated: bool,
-}
-
-impl StreamingPreview {
-    fn capture(&mut self, bytes: &[u8]) {
-        let remaining = ARCHIVE_BODY_LIMIT.saturating_sub(self.body.len());
-        let copied = remaining.min(bytes.len());
-        self.body.extend_from_slice(&bytes[..copied]);
-        self.truncated |= copied < bytes.len();
-    }
-}
-
 fn thread_id(headers: &HeaderMap) -> Option<String> {
-    ["x-deepseek-session-id", "thread-id", "session-id"]
+    ["x-qwen-session-id", "thread-id", "session-id"]
         .iter()
         .find_map(|name| {
             headers
@@ -1452,8 +1423,8 @@ fn thread_id(headers: &HeaderMap) -> Option<String> {
 
 /// Request IDs assigned by an upstream gateway (NormAI) keep one identifier
 /// across the whole chain: the value is stored as the audit `request_id`, is
-/// echoed as `x-deepseek-lb-request-id`, and is the key of the cost query
-/// API. Invalid or missing values fall back to a fresh UUID.
+/// echoed as `x-qwen-lb-request-id`, and is the key of the cost query API.
+/// Invalid or missing values fall back to a fresh UUID.
 const GATEWAY_REQUEST_ID_HEADER: &str = "x-normai-request-id";
 
 fn unified_request_id(headers: &HeaderMap) -> String {
@@ -1469,1226 +1440,425 @@ fn is_valid_request_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
-const SSE_EVENT_LIMIT: usize = 8 * 1024 * 1024;
-
-#[derive(Debug, PartialEq, Eq)]
-struct ResponseFailure {
-    code: Option<String>,
-    message: String,
-}
-
-fn response_failure(event_name: &str, value: &Value) -> Option<ResponseFailure> {
-    let error = value
-        .pointer("/response/error")
-        .filter(|error| error.is_object());
-    let failed = event_name == "response.failed"
-        || value.get("type").and_then(Value::as_str) == Some("response.failed");
-    if error.is_none() && !failed {
-        return None;
-    }
-    Some(ResponseFailure {
-        code: error
-            .and_then(|error| error.get("code"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        message: error
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("response.failed")
-            .to_owned(),
-    })
-}
-
-struct SseObservation {
-    decoder: sse_core::SseDecoder,
-    usage: Usage,
-    failure: Option<ResponseFailure>,
-}
-
-impl Default for SseObservation {
-    fn default() -> Self {
-        Self {
-            decoder: sse_core::SseDecoder::with_limit(
-                std::num::NonZeroUsize::new(SSE_EVENT_LIMIT).expect("SSE event limit is positive"),
-            ),
-            usage: Usage::default(),
-            failure: None,
-        }
-    }
-}
-
-impl SseObservation {
-    fn capture(&mut self, mut bytes: &[u8]) {
-        while let Some(event) = self.decoder.next(&mut bytes) {
-            let message = match event {
-                Ok(sse_core::SseEvent::Message(message)) => message,
-                Ok(sse_core::SseEvent::Retry(_)) => continue,
-                Err(error) => {
-                    // RECOVERY: the decoder skips this oversized event and resumes at the next
-                    // event boundary. Keep forwarding bytes, but do not report uninspected data as success.
-                    self.failure.get_or_insert_with(|| ResponseFailure {
-                        code: None,
-                        message: format!("SSE inspection failed: {error}"),
-                    });
-                    continue;
-                }
-            };
-            let value = match serde_json::from_str::<Value>(&message.data) {
-                Ok(value) => value,
-                Err(_) if message.event == "response.failed" => Value::Null,
-                Err(_) => continue,
-            };
-            self.usage.merge(usage_from_value(&value));
-            if let Some(failure) = response_failure(&message.event, &value) {
-                self.failure = Some(failure);
-            }
-        }
-    }
-}
-
 fn error_from(status: StatusCode, bytes: &[u8]) -> Option<String> {
     (!status.is_success()).then(|| {
         serde_json::from_slice::<Value>(bytes)
             .ok()
-            .and_then(|v| {
-                v.pointer("/error/message")
+            .and_then(|value| {
+                value
+                    .pointer("/error/message")
                     .and_then(Value::as_str)
+                    .or_else(|| value.get("message").and_then(Value::as_str))
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| format!("upstream HTTP {}", status.as_u16()))
     })
 }
 
-fn ensure_model_is_available(state: &AppState, model: &str) -> Result<(), AppError> {
-    state
-        .config
-        .load()
-        .available_model_ids
-        .iter()
-        .any(|allowed| allowed == model)
-        .then_some(())
-        .ok_or_else(|| AppError::bad_request(format!("model is not available: {model}")))
-}
-
-fn models_response(models: &[String]) -> Result<Response, AppError> {
-    let body = serde_json::to_vec(
-        &json!({"object":"list","data":models.iter().map(|id| json!({"id":id,"object":"model","owned_by":"deepseek"})).collect::<Vec<_>>() }),
-    )?;
-    build_response(
-        StatusCode::OK,
-        vec![(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        )],
-        Body::from(body),
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
+    use std::net::SocketAddr;
+    use std::sync::Arc;
 
     use axum::{
-        Json, Router,
-        extract::{OriginalUri, State},
-        http::{HeaderMap, Request, StatusCode, header},
+        Router,
+        body::Body,
+        extract::ConnectInfo,
+        http::{Request, StatusCode},
         response::{IntoResponse, Response},
         routing::{get, post},
     };
     use http_body_util::BodyExt;
-    use sqlx::Row;
+    use tokio::sync::Mutex;
     use tower::ServiceExt;
 
     use super::*;
-    use crate::{AppState, crypto::consumer_secret_hash, payments};
+    use crate::{crypto::consumer_secret_hash, router};
 
-    const CONSUMER_SECRET: &str = "sk-consumer-test-secret";
-    const FAILING_PROVIDER_KEY: &str = "sk-provider-failing";
+    const CONSUMER_SECRET: &str = "sk-test-secret";
 
-    #[derive(Clone)]
-    struct RecordedRequest {
-        path: String,
-        headers: HeaderMap,
-        body: Bytes,
-    }
-
-    #[derive(Clone)]
-    struct MockUpstream {
-        records: Arc<Mutex<Vec<RecordedRequest>>>,
-    }
-
-    async fn mock_upstream(
-        State(mock): State<MockUpstream>,
-        OriginalUri(uri): OriginalUri,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> Response {
-        mock.records.lock().unwrap().push(RecordedRequest {
-            path: uri.path().to_owned(),
-            headers: headers.clone(),
-            body: body.clone(),
-        });
-        let authorization = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned();
-        if authorization == format!("Bearer {FAILING_PROVIDER_KEY}") {
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"error":{"message":"upstream exploded","type":"server_error"}}"#,
-                ))
-                .unwrap();
-        }
-        if uri.path() == "/anthropic/v1/messages" {
-            assert_eq!(
-                headers
-                    .get("anthropic-version")
-                    .and_then(|value| value.to_str().ok()),
-                Some("2023-06-01")
-            );
-            return Json(anthropic_search_response(&body)).into_response();
-        }
-        let payload = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-        let stream = payload
-            .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or_default();
-        match uri.path() {
-            "/user/balance" => Json(json!({
-                "is_available": true,
-                "balance_infos": [{"currency":"USD","total_balance":"12.34","granted_balance":"0.00","topped_up_balance":"12.34"}]
-            }))
-            .into_response(),
-            "/chat/completions" if stream => {
-                let events = concat!(
-                    "data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"po\"}}]}\n\n",
-                    "data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ng\"}}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"prompt_cache_hit_tokens\":3,\"prompt_cache_miss_tokens\":8}}\n\n",
-                    "data: [DONE]\n\n",
-                );
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .body(Body::from(events))
-                    .unwrap()
-            }
-            "/responses" if stream => {
-                let events = concat!(
-                    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
-                    "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"model\":\"deepseek-flash\",\"usage\":{\"input_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":2},\"output_tokens\":4}}}\n\n",
-                );
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .body(Body::from(events))
-                    .unwrap()
-            }
-            "/chat/completions" => Json(json!({
-                "id": "chatcmpl-test",
-                "object": "chat.completion",
-                "model": "deepseek-flash",
-                "choices": [{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],
-                "usage": {"prompt_tokens":11,"completion_tokens":5,"prompt_cache_hit_tokens":3,"prompt_cache_miss_tokens":8}
-            }))
-            .into_response(),
-            _ => Json(json!({
-                "id": "resp-test",
-                "object": "response",
-                "model": "deepseek-flash",
-                "output": [{"type":"message","role":"assistant","content":[{"type":"output_text","text":"pong"}]}],
-                "usage": {"input_tokens":7,"input_tokens_details":{"cached_tokens":2},"output_tokens":4}
-            }))
-            .into_response(),
-        }
-    }
-
-    /// One Anthropic-compatible Messages turn: a server-side search use, its
-    /// structured results, and the model prose that cites one of them.
-    fn anthropic_search_response(request: &Bytes) -> Value {
-        let request = serde_json::from_slice::<Value>(request).unwrap_or(Value::Null);
-        let query = request
-            .pointer("/messages/0/content/0/text")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            query.starts_with("Perform a web search for the query: "),
-            "the search turn carries the DeepSeek Harness instruction"
-        );
-        if query.contains("no results") {
-            return json!({
-                "id": "msg-empty",
-                "model": "deepseek-flash",
-                "content": [{"type": "text", "text": "I already know the answer."}],
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 9, "output_tokens": 12, "server_tool_use": {"web_search_requests": 0}},
-            });
-        }
-        json!({
-            "id": "msg-search",
-            "model": "deepseek-flash",
-            "content": [
-                {"type": "server_tool_use", "name": "web_search", "input": {"query": "rust release"}},
-                {"type": "server_tool_use", "name": "web_search", "input": {"query": "rust release"}},
-                {
-                    "type": "web_search_tool_result",
-                    "tool_use_id": "srvtoolu_1",
-                    "content": [
-                        {"type": "web_search_result", "url": "https://example.com/one", "title": "One", "page_age": "2026-10-01"},
-                        {"type": "web_search_result", "url": "https://example.com/two", "title": "Two"},
-                    ],
-                },
-                {
-                    "type": "text",
-                    "text": "Rust 1.93 is out.",
-                    "citations": [{"type": "web_search_result_location", "url": "https://example.com/two", "cited_text": "two excerpt"}],
-                },
-            ],
-            "stop_reason": "end_turn",
-            "usage": {
-                "input_tokens": 9,
-                "output_tokens": 40,
-                "cache_read_input_tokens": 2,
-                "cache_creation_input_tokens": 1,
-                "server_tool_use": {"web_search_requests": 1},
-            },
-        })
-    }
-
-    async fn spawn_mock() -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
-        let records = Arc::new(Mutex::new(Vec::new()));
-        let mock = MockUpstream {
-            records: records.clone(),
-        };
-        let app = Router::new()
-            .route("/chat/completions", post(mock_upstream))
-            .route("/anthropic/v1/messages", post(mock_upstream))
-            .route("/responses", post(mock_upstream))
-            .route("/user/balance", get(mock_upstream))
-            .with_state(mock);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{address}"), records)
-    }
-
-    async fn seed_consumer(state: &AppState, credit_usd_nanos: i64) {
-        sqlx::query(
-            "INSERT INTO users(id,role,created_at,provided_usd_nanos) VALUES('user','user',0,?)",
-        )
-        .bind(credit_usd_nanos)
-        .execute(&state.db)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('consumer','user','test','sk-consumer',?,0)")
+    async fn seed_consumer_and_owner(state: &AppState, owner: &str) {
+        sqlx::query("INSERT INTO users(id,role,created_at,provided_usd_nanos) VALUES(?,'user',0,1000000000000)")
+            .bind(owner)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES(?,?, 'test','sk-test',?,0)")
+            .bind(format!("consumer-{owner}"))
+            .bind(owner)
             .bind(consumer_secret_hash(CONSUMER_SECRET))
             .execute(&state.db)
             .await
             .unwrap();
     }
 
-    async fn seed_provider(state: &AppState, id: &str, api_key: &str) {
-        sqlx::query("INSERT INTO providers(id,name,api_key,status,created_at,updated_at,owner_id,visibility) VALUES(?,?,?,'active',0,0,'user','public')")
+    #[derive(Clone)]
+    struct UpstreamRequest {
+        authorization: Option<String>,
+        body: Value,
+    }
+
+    struct SettledCall {
+        provider_id: Option<String>,
+        status: i64,
+        model: Option<String>,
+        audio_seconds: f64,
+        characters: i64,
+        cost_usd_nanos: i64,
+    }
+
+    /// The audit writer persists batches asynchronously; poll for the settled row.
+    async fn wait_for_call(state: &AppState, request_id: &str) -> SettledCall {
+        for _ in 0..500 {
+            let row = sqlx::query_as::<_, (Option<String>, i64, Option<String>, f64, i64, i64)>(
+                "SELECT provider_id,status,model,audio_seconds,characters,cost_usd_nanos FROM api_calls WHERE request_id=?",
+            )
+            .bind(request_id)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap();
+            if let Some((provider_id, status, model, audio_seconds, characters, cost_usd_nanos)) =
+                row
+            {
+                return SettledCall {
+                    provider_id,
+                    status,
+                    model,
+                    audio_seconds,
+                    characters,
+                    cost_usd_nanos,
+                };
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("audit row for {request_id} was never written");
+    }
+
+    async fn seed_provider(state: &AppState, id: &str, api_key: &str, owner: &str) {
+        sqlx::query("INSERT INTO providers(id,name,api_key,status,owner_id,created_at,updated_at) VALUES(?,?,?,'active',?,0,0)")
             .bind(id)
             .bind(id)
             .bind(api_key)
+            .bind(owner)
             .execute(&state.db)
             .await
             .unwrap();
         state.balancer.reload_providers(&state.db).await.unwrap();
     }
 
-    fn proxy_request(path: &str, body: Value) -> Request<Body> {
-        let mut request = Request::builder()
-            .method("POST")
-            .uri(path)
-            .header(header::AUTHORIZATION, format!("Bearer {CONSUMER_SECRET}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
+    fn spawn_server(app: Router) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    async fn send(state: AppState, request: Request<Body>) -> Response {
+        let mut request = request;
         request
             .extensions_mut()
-            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
-                [127, 0, 0, 1],
-                40_000,
-            ))));
-        request
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+        router(state).oneshot(request).await.unwrap()
     }
 
-    async fn wait_for_audits(state: &AppState, expected: i64) -> Vec<sqlx::sqlite::SqliteRow> {
-        for _ in 0..200 {
-            let rows = sqlx::query("SELECT * FROM api_calls ORDER BY created_at,id")
-                .fetch_all(&state.db)
-                .await
-                .unwrap();
-            if rows.len() as i64 >= expected {
-                return rows;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("audit rows were not written in time");
-    }
-
-    #[tokio::test]
-    async fn chat_completions_relays_the_response_and_audits_deepseek_usage() {
-        let (upstream, records) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        seed_provider(&state, "provider-1", "sk-provider-ok").await;
-
-        let response = crate::router(state.clone())
-            .oneshot(proxy_request(
-                "/v1/chat/completions",
-                json!({"model":"deepseek-flash","messages":[{"role":"user","content":"ping"}]}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(
-            std::str::from_utf8(&body).unwrap().contains("pong"),
-            "upstream response body is relayed"
-        );
-
-        let recorded = records.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].path, "/chat/completions");
-        assert_eq!(
-            recorded[0]
-                .headers
-                .get(header::AUTHORIZATION)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "Bearer sk-provider-ok"
-        );
-        assert!(
-            !String::from_utf8_lossy(&recorded[0].body).contains(CONSUMER_SECRET),
-            "the consumer credential never reaches DeepSeek"
-        );
-
-        let audits = wait_for_audits(&state, 1).await;
-        let audit = &audits[0];
-        assert_eq!(audit.get::<String, _>("path"), "/v1/chat/completions");
-        assert_eq!(audit.get::<String, _>("model"), "deepseek-flash");
-        assert_eq!(audit.get::<String, _>("provider_id"), "provider-1");
-        assert_eq!(audit.get::<i64, _>("status"), 200);
-        assert_eq!(audit.get::<i64, _>("input_tokens"), 11);
-        assert_eq!(audit.get::<i64, _>("output_tokens"), 5);
-        assert_eq!(audit.get::<i64, _>("cached_tokens"), 3);
-        let created_at = audit.get::<i64, _>("created_at");
-        assert_eq!(
-            audit.get::<i64, _>("peak") != 0,
-            pricing::is_peak(created_at),
-            "the audit row records the DeepSeek tariff of the request"
-        );
-        assert!(
-            audit.get::<i64, _>("official_cost_usd_nanos") > 0,
-            "usage is priced with the DeepSeek price table"
-        );
-        assert_eq!(
-            audit.get::<i64, _>("actual_cost_usd_nanos"),
-            audit.get::<i64, _>("official_cost_usd_nanos")
-        );
-    }
-
-    #[tokio::test]
-    async fn web_search_returns_normalized_sources_and_bills_the_search_turn() {
-        let (upstream, records) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        seed_provider(&state, "provider-1", "sk-provider-ok").await;
-
-        let response = crate::router(state.clone())
-            .oneshot(proxy_request(
-                "/v1/web-search",
-                json!({
-                    "query":"rust 1.93",
-                    "max_results":1,
-                    "max_uses":2,
-                    "allowed_domains":["blog.rust-lang.org"],
-                    "user_location":{"country":"CN","timezone":"Asia/Shanghai"},
-                }),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let request_id = response
-            .headers()
-            .get("x-deepseek-lb-request-id")
-            .expect("the search response carries the query key")
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let body: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(body["model"], "deepseek-flash");
-        assert_eq!(
-            body["queries"],
-            json!(["rust release"]),
-            "the envelope reports the queries the turn actually ran"
-        );
-        assert_eq!(body["truncated"], true);
-        assert_eq!(
-            body["sources"],
-            json!([{
-                "url": "https://example.com/one",
-                "title": "One",
-                "published_at": "2026-10-01",
-            }]),
-            "the envelope carries cited sources, never model prose"
-        );
-        assert_eq!(
-            body["usage"],
-            json!({"input_tokens": 12, "output_tokens": 40, "cached_tokens": 2})
-        );
-
-        let recorded = records.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].path, "/anthropic/v1/messages");
-        assert_eq!(
-            recorded[0]
-                .headers
-                .get(header::AUTHORIZATION)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "Bearer sk-provider-ok"
-        );
-        let sent = serde_json::from_slice::<Value>(&recorded[0].body).unwrap();
-        assert_eq!(sent["model"], "deepseek-flash");
-        assert_eq!(
-            sent["tools"][0],
-            json!({
-                "type":"web_search_20250305",
-                "name":"web_search",
-                "max_uses":2,
-                "allowed_domains":["blog.rust-lang.org"],
-                "user_location":{"type":"approximate","country":"CN","timezone":"Asia/Shanghai"},
-            })
-        );
-        assert_eq!(
-            sent["messages"][0]["content"][0]["text"],
-            "Perform a web search for the query: rust 1.93"
-        );
-        assert!(
-            !String::from_utf8_lossy(&recorded[0].body).contains(CONSUMER_SECRET),
-            "the consumer credential never reaches DeepSeek"
-        );
-
-        let audits = wait_for_audits(&state, 1).await;
-        let audit = &audits[0];
-        assert_eq!(audit.get::<String, _>("request_id"), request_id);
-        assert_eq!(audit.get::<String, _>("path"), "/v1/web-search");
-        assert_eq!(audit.get::<String, _>("model"), "deepseek-flash");
-        assert_eq!(audit.get::<String, _>("provider_id"), "provider-1");
-        assert_eq!(audit.get::<i64, _>("status"), 200);
-        assert_eq!(audit.get::<i64, _>("input_tokens"), 12);
-        assert_eq!(audit.get::<i64, _>("output_tokens"), 40);
-        assert_eq!(audit.get::<i64, _>("cached_tokens"), 2);
-        assert!(
-            audit.get::<i64, _>("official_cost_usd_nanos") > 0,
-            "a search turn is priced like any other model turn"
-        );
-    }
-
-    #[tokio::test]
-    async fn web_search_rejects_a_missing_query_and_an_out_of_range_bound() {
-        let (upstream, records) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        seed_provider(&state, "provider-1", "sk-provider-ok").await;
-
-        for (body, expected) in [
-            (json!({}), "query must be a non-empty string"),
-            (json!({"query":"   "}), "query must be a non-empty string"),
-            (
-                json!({"query":"rust","max_results":0}),
-                "max_results must be an integer between 1 and 50",
-            ),
-            (
-                json!({"query":"rust","max_results":"many"}),
-                "max_results must be an integer between 1 and 50",
-            ),
-            (
-                json!({"query":"rust","max_uses":9}),
-                "max_uses must be an integer between 1 and 5",
-            ),
-            (
-                json!({"query":"rust","blocked_domains":["example.com","bad domain"]}),
-                "blocked_domains must contain bare domain names like example.com",
-            ),
-            (
-                json!({"query":"rust","user_location":{"type":"exact"}}),
-                "user_location type must be approximate",
-            ),
-        ] {
-            let response = crate::router(state.clone())
-                .oneshot(proxy_request("/v1/web-search", body.clone()))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
-            let error: Value =
-                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                    .unwrap();
-            assert_eq!(error["error"]["message"], expected);
-        }
-        assert!(
-            records.lock().unwrap().is_empty(),
-            "rejected searches never reach DeepSeek"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_search_turn_without_results_fails_loudly() {
-        let (upstream, _) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        seed_provider(&state, "provider-1", "sk-provider-ok").await;
-
-        let response = crate::router(state.clone())
-            .oneshot(proxy_request(
-                "/v1/web-search",
-                json!({"query":"no results please"}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let error: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(error["error"]["reason"], "web_search_data_missing");
-        assert!(
-            error["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("after 0 server-side search(es)"),
-            "the failure explains what the search turn did"
-        );
-
-        let audits = wait_for_audits(&state, 1).await;
-        assert_eq!(audits[0].get::<i64, _>("status"), 502);
-        assert_eq!(
-            audits[0].get::<String, _>("error_code"),
-            "web_search_data_missing"
-        );
-    }
-
-    #[tokio::test]
-    async fn console_web_search_runs_under_the_hidden_console_consumer() {
-        let (upstream, _) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        sqlx::query("INSERT INTO users(id,role,created_at,provided_usd_nanos) VALUES('user','user',0,0),('operator','user',0,?)")
-            .bind(payments::USD_NANOS)
-            .execute(&state.db)
-            .await
-            .unwrap();
-        seed_provider(&state, "provider-1", "sk-provider-ok").await;
-
-        let run = |query: &str| {
-            super::handle_console_web_search(
-                State(state.clone()),
-                ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 40_000))),
-                Extension(UserIdentity {
-                    id: "operator".to_owned(),
-                    email: None,
-                    name: None,
-                    role: "user".to_owned(),
-                }),
-                HeaderMap::new(),
-                Bytes::from(serde_json::to_vec(&json!({"query":query})).unwrap()),
+    fn transcription_multipart(boundary: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
             )
-        };
-
-        let response = run("rust 1.93").await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(body["sources"].as_array().unwrap().len(), 2);
-
-        let audits = wait_for_audits(&state, 1).await;
-        let consumer_id = audits[0].get::<String, _>("consumer_id");
-        assert!(consumer_id.starts_with("console-"));
-        let (name, is_system, archived): (String, i64, i64) =
-            sqlx::query_as("SELECT name,is_system,request_archive FROM consumers WHERE id=?")
-                .bind(&consumer_id)
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
-        assert_eq!(name, "DeepSeek-LB Console");
-        assert_eq!(
-            is_system, 1,
-            "the console consumer never appears as a user key"
+            .as_bytes(),
         );
-        assert_eq!(archived, 1, "console searches keep their diagnostics");
-        assert_eq!(audits[0].get::<String, _>("user_id"), "operator");
-
-        // The console consumer is created once and reused.
-        assert_eq!(run("rust 1.94").await.unwrap().status(), StatusCode::OK);
-        let consumers: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM consumers WHERE user_id='operator'")
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
-        assert_eq!(consumers, 1);
-    }
-
-    #[tokio::test]
-    async fn responses_streams_event_stream_data_and_audits_the_completed_usage() {
-        let (upstream, _) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        seed_provider(&state, "provider-1", "sk-provider-ok").await;
-
-        let response = crate::router(state.clone())
-            .oneshot(proxy_request(
-                "/v1/responses",
-                json!({"model":"deepseek-v4-pro","stream":true,"input":"ping"}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let request_id = response
-            .headers()
-            .get("x-deepseek-lb-request-id")
-            .expect("streaming responses carry the query key")
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("response.completed"));
-        assert!(text.contains("data:"));
-
-        let audits = wait_for_audits(&state, 1).await;
-        let audit = &audits[0];
-        assert_eq!(audit.get::<String, _>("request_id"), request_id);
-        assert_eq!(audit.get::<String, _>("path"), "/v1/responses");
-        assert_eq!(audit.get::<String, _>("model"), "deepseek-v4-pro");
-        assert_eq!(audit.get::<i64, _>("input_tokens"), 7);
-        assert_eq!(audit.get::<i64, _>("output_tokens"), 4);
-        assert_eq!(audit.get::<i64, _>("cached_tokens"), 2);
-        assert!(
-            audit
-                .get::<Option<i64>, _>("first_byte_latency_ms")
-                .is_some()
-        );
-    }
-
-    async fn fetch_record(state: &AppState, path: &str, credential: &str) -> Response {
-        crate::router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(path)
-                    .header(header::AUTHORIZATION, format!("Bearer {credential}"))
-                    .body(Body::empty())
-                    .unwrap(),
+        body.extend_from_slice(b"RIFFdata");
+        body.extend_from_slice(
+            format!(
+                "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nqwen-audio-3.0-asr-flash\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nzh\r\n--{boundary}--\r\n"
             )
-            .await
-            .unwrap()
+            .as_bytes(),
+        );
+        body
     }
 
-    async fn request_query(state: &AppState, path: &str, body: Value) -> Response {
-        crate::router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(path)
-                    .header(header::AUTHORIZATION, format!("Bearer {CONSUMER_SECRET}"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                    .unwrap(),
+    #[tokio::test]
+    async fn transcription_parses_multipart_builds_the_native_body_and_wraps_the_reply() {
+        let seen: Arc<Mutex<Option<UpstreamRequest>>> = Arc::default();
+        let seen_upstream = seen.clone();
+        let upstream = Router::new().route(
+            GENERATION_PATH,
+            post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let seen = seen_upstream.clone();
+                async move {
+                    let authorization = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    let value = serde_json::from_slice(&body).unwrap();
+                    *seen.lock().await = Some(UpstreamRequest {
+                        authorization,
+                        body: value,
+                    });
+                    Json(json!({
+                        "output": {"text": "欢迎使用阿里云。"},
+                        "usage": {"duration": 2.5},
+                    }))
+                }
+            }),
+        );
+        let base = spawn_server(upstream);
+        let state = crate::test_state(&base).await;
+        seed_consumer_and_owner(&state, "user").await;
+        seed_provider(&state, "provider", "sk-provider", "user").await;
+
+        let boundary = "qwen-boundary";
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header(header::AUTHORIZATION, format!("Bearer {CONSUMER_SECRET}"))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
             )
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn request_record_query_returns_the_settled_amount_for_any_valid_credential() {
-        let (upstream, _) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        seed_provider(&state, "provider-1", "sk-provider-ok").await;
-        sqlx::query(
-            "INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('consumer-2','user','other','sk-other',?,0)",
-        )
-        .bind(consumer_secret_hash("sk-consumer-2-secret"))
-        .execute(&state.db)
-        .await
-        .unwrap();
-
-        let response = crate::router(state.clone())
-            .oneshot(proxy_request(
-                "/v1/chat/completions",
-                json!({"model":"deepseek-flash","messages":[{"role":"user","content":"ping"}]}),
-            ))
-            .await
+            .header("x-normai-request-id", "req-integration-1")
+            .body(Body::from(transcription_multipart(boundary)))
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let request_id = response
-            .headers()
-            .get("x-deepseek-lb-request-id")
-            .expect("the inference response carries the query key")
-            .to_str()
-            .unwrap()
-            .to_owned();
-        response.into_body().collect().await.unwrap();
-
-        let audits = wait_for_audits(&state, 1).await;
-        let audit = &audits[0];
-        assert_eq!(audit.get::<String, _>("request_id"), request_id);
-
-        // A different consumer credential can read the record: lookups are
-        // addressed by request ID only.
-        let response = fetch_record(
-            &state,
-            &format!("/v1/requests/{request_id}"),
-            "sk-consumer-2-secret",
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let record: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(record["request_id"].as_str(), Some(request_id.as_str()));
-        assert_eq!(record["status"].as_i64(), Some(200));
-        assert_eq!(record["model"].as_str(), Some("deepseek-flash"));
-        assert_eq!(
-            record["input_tokens"].as_i64(),
-            Some(audit.get::<i64, _>("input_tokens"))
-        );
-        assert_eq!(
-            record["output_tokens"].as_i64(),
-            Some(audit.get::<i64, _>("output_tokens"))
-        );
-        assert_eq!(
-            record["cached_tokens"].as_i64(),
-            Some(audit.get::<i64, _>("cached_tokens"))
-        );
-        assert_eq!(
-            record["cost_usd_nanos"].as_i64(),
-            Some(audit.get::<i64, _>("actual_cost_usd_nanos"))
-        );
-        assert_eq!(
-            record["created_at"].as_i64(),
-            Some(audit.get::<i64, _>("created_at"))
-        );
-    }
-
-    #[tokio::test]
-    async fn request_record_query_waits_for_a_settlement_that_lands_late() {
-        let state = crate::test_state("http://upstream.invalid").await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        let db = state.db.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            sqlx::query(
-                "INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,model,status,latency_ms,input_tokens,output_tokens,cached_tokens,actual_cost_usd_nanos,error,created_at) VALUES('late-row','late-record','consumer','user','POST','/v1/chat/completions','deepseek-flash',499,10,0,0,0,7,'client_cancelled',unixepoch())",
-            )
-            .execute(&db)
-            .await
-            .unwrap();
-        });
-
-        // The bare alias resolves the same route family.
-        let response = fetch_record(&state, "/requests/late-record", CONSUMER_SECRET).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let record: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(record["request_id"].as_str(), Some("late-record"));
-        assert_eq!(record["status"].as_i64(), Some(499));
-        assert_eq!(record["cost_usd_nanos"].as_i64(), Some(7));
-    }
-
-    #[tokio::test]
-    async fn batch_request_query_splits_settled_records_and_missing_ids() {
-        let state = crate::test_state("http://upstream.invalid").await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        for (id, status, cost) in [("record-a", 200, 5), ("record-b", 499, 0)] {
-            sqlx::query(
-                "INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,actual_cost_usd_nanos,created_at) VALUES(?,?,'consumer','user','POST','/v1/chat/completions',?,1,?,unixepoch())",
-            )
-            .bind(id)
-            .bind(id)
-            .bind(status)
-            .bind(cost)
-            .execute(&state.db)
-            .await
-            .unwrap();
-        }
-
-        let response = request_query(
-            &state,
-            "/v1/requests/query",
-            json!({"ids":["record-b","missing-1","record-a","record-b"]}),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        let requests = body["requests"].as_array().expect("requests array");
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0]["request_id"].as_str(), Some("record-b"));
-        assert_eq!(requests[0]["status"].as_i64(), Some(499));
-        assert_eq!(requests[0]["cost_usd_nanos"].as_i64(), Some(0));
-        assert_eq!(requests[1]["request_id"].as_str(), Some("record-a"));
-        assert_eq!(requests[1]["cost_usd_nanos"].as_i64(), Some(5));
-        assert_eq!(body["missing"], json!(["missing-1"]));
-
-        // The bare alias returns HTTP 200 even when nothing is settled yet.
-        let response =
-            request_query(&state, "/requests/query", json!({"ids":["still-missing"]})).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(body["requests"], json!([]));
-        assert_eq!(body["missing"], json!(["still-missing"]));
-    }
-
-    #[tokio::test]
-    async fn request_queries_reject_invalid_input_and_missing_credentials() {
-        let state = crate::test_state("http://upstream.invalid").await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-
-        let response = request_query(&state, "/v1/requests/query", json!({"ids":[]})).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        let ids = (0..=REQUEST_QUERY_MAX_IDS)
-            .map(|index| format!("id-{index}"))
-            .collect::<Vec<_>>();
-        let response = request_query(&state, "/v1/requests/query", json!({"ids":ids})).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        let response = crate::router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/v1/requests/any-id")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn request_record_query_reports_unknown_ids_with_a_reason() {
-        let state = crate::test_state("http://upstream.invalid").await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        let response = fetch_record(
-            &state,
-            "/v1/requests/00000000-0000-4000-8000-000000000000",
-            CONSUMER_SECRET,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(body["error"]["reason"].as_str(), Some("request_not_found"));
-        assert_eq!(
-            body["error"]["lb"].as_str(),
-            Some("deepseek"),
-            "the not-found answer names this load balancer for the gateway probe"
-        );
-    }
-
-    #[tokio::test]
-    async fn gateway_request_ids_flow_through_the_response_and_the_queries() {
-        let (upstream, _) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        seed_provider(&state, "provider-1", "sk-provider-ok").await;
-
-        let mut request = proxy_request(
-            "/v1/chat/completions",
-            json!({"model":"deepseek-flash","messages":[{"role":"user","content":"ping"}]}),
-        );
-        request.headers_mut().insert(
-            "x-normai-request-id",
-            axum::http::HeaderValue::from_static("norm-7f3a9c1e"),
-        );
-        let response = crate::router(state.clone()).oneshot(request).await.unwrap();
+        let response = send(state.clone(), request).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response
                 .headers()
-                .get("x-deepseek-lb-request-id")
+                .get("x-qwen-lb-request-id")
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "norm-7f3a9c1e"
+            "req-integration-1"
         );
-        response.into_body().collect().await.unwrap();
-
-        let audits = wait_for_audits(&state, 1).await;
-        assert_eq!(audits[0].get::<String, _>("request_id"), "norm-7f3a9c1e");
-
-        let response = fetch_record(&state, "/v1/requests/norm-7f3a9c1e", CONSUMER_SECRET).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let record: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(record["request_id"].as_str(), Some("norm-7f3a9c1e"));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(
-            record["cost_usd_nanos"].as_i64(),
-            Some(audits[0].get::<i64, _>("actual_cost_usd_nanos"))
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"text": "欢迎使用阿里云。"})
         );
 
-        let response = request_query(
-            &state,
-            "/v1/requests/query",
-            json!({"ids":["norm-7f3a9c1e"]}),
-        )
-        .await;
-        let body: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
+        let upstream_request = seen.lock().await.clone().unwrap();
+        let upstream_body = &upstream_request.body;
         assert_eq!(
-            body["requests"][0]["request_id"].as_str(),
-            Some("norm-7f3a9c1e")
+            upstream_request.authorization.as_deref(),
+            Some("Bearer sk-provider")
         );
-        assert_eq!(body["missing"], json!([]));
+        assert_eq!(upstream_body["model"], "qwen-audio-3.0-asr-flash");
+        assert_eq!(upstream_body["parameters"]["format"], "wav");
+        assert_eq!(upstream_body["parameters"]["language_hints"], json!(["zh"]));
+        let content = &upstream_body["input"]["messages"][0]["content"][0];
+        assert_eq!(content["type"], "input_audio");
+        let data = content["input_audio"]["data"].as_str().unwrap();
+        let (prefix, payload) = data.split_once(',').unwrap();
+        assert_eq!(prefix, "data:audio/wav;base64");
+        assert_eq!(BASE64.decode(payload).unwrap(), b"RIFFdata");
+
+        let call = wait_for_call(&state, "req-integration-1").await;
+        assert_eq!(call.status, 200);
+        assert_eq!(call.model.as_deref(), Some("qwen-audio-3.0-asr-flash"));
+        assert_eq!(call.audio_seconds, 2.5);
+        assert_eq!(call.cost_usd_nanos, 76_390);
     }
 
     #[tokio::test]
-    async fn invalid_gateway_request_ids_fall_back_to_generated_ids() {
-        let (upstream, _) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        seed_provider(&state, "provider-1", "sk-provider-ok").await;
-
-        // A value containing a space is not a valid request ID; the service
-        // must not adopt it.
-        let mut request = proxy_request(
-            "/v1/chat/completions",
-            json!({"model":"deepseek-flash","messages":[{"role":"user","content":"ping"}]}),
-        );
-        request.headers_mut().insert(
-            "x-normai-request-id",
-            axum::http::HeaderValue::from_static("not a valid id"),
-        );
-        let response = crate::router(state.clone()).oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let header = response
-            .headers()
-            .get("x-deepseek-lb-request-id")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
-        assert_ne!(header, "not a valid id");
-        response.into_body().collect().await.unwrap();
-        let audits = wait_for_audits(&state, 1).await;
-        assert_eq!(audits[0].get::<String, _>("request_id"), header);
-
-        // A request without the header takes the same fallback path.
-        let response = crate::router(state.clone())
-            .oneshot(proxy_request(
-                "/v1/chat/completions",
-                json!({"model":"deepseek-flash","messages":[{"role":"user","content":"ping"}]}),
-            ))
-            .await
-            .unwrap();
-        let header = response
-            .headers()
-            .get("x-deepseek-lb-request-id")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
-        assert!(Uuid::parse_str(&header).is_ok(), "fallback generates UUIDs");
-        response.into_body().collect().await.unwrap();
-        let audits = wait_for_audits(&state, 2).await;
-        assert!(
-            audits
-                .iter()
-                .any(|row| row.get::<String, _>("request_id") == header)
-        );
-    }
-
-    #[tokio::test]
-    async fn duplicate_request_ids_resolve_to_the_latest_record() {
-        let state = crate::test_state("http://upstream.invalid").await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        for (row_id, created_at, cost) in [("dup-first", 100, 0), ("dup-second", 200, 9)] {
-            sqlx::query(
-                "INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,actual_cost_usd_nanos,created_at) VALUES(?, 'dup-id','consumer','user','POST','/v1/chat/completions',200,1,?,?)",
+    async fn speech_downloads_the_synthesized_audio_and_meters_characters() {
+        let audio: Vec<u8> = vec![0x52, 0x49, 0x46, 0x46, 0x10, 0x20, 0x30, 0x40];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let base = format!("http://{addr}");
+        let generation_base = base.clone();
+        let audio_route = audio.clone();
+        let upstream = Router::new()
+            .route(
+                GENERATION_PATH,
+                post(move || {
+                    let base = generation_base.clone();
+                    async move {
+                        Json(json!({
+                            "output": {"audio": {"url": format!("{base}/audio.wav")}},
+                            "usage": {"characters": 7},
+                        }))
+                    }
+                }),
             )
-            .bind(row_id)
-            .bind(cost)
-            .bind(created_at)
-            .execute(&state.db)
-            .await
+            .route(
+                "/audio.wav",
+                get(move || {
+                    let audio = audio_route.clone();
+                    async move { ([(header::CONTENT_TYPE, "audio/wav")], audio) }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state = crate::test_state(&base).await;
+        seed_consumer_and_owner(&state, "user").await;
+        seed_provider(&state, "provider", "sk-provider", "user").await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header(header::AUTHORIZATION, format!("Bearer {CONSUMER_SECRET}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-normai-request-id", "req-integration-2")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "input": "你好，世界",
+                    "model": "qwen3-tts-flash",
+                    "voice": "Cherry",
+                }))
+                .unwrap(),
+            ))
             .unwrap();
-        }
-
-        let response = fetch_record(&state, "/v1/requests/dup-id", CONSUMER_SECRET).await;
+        let response = send(state.clone(), request).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let record: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(record["cost_usd_nanos"].as_i64(), Some(9));
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "audio/wav"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-qwen-lb-request-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "req-integration-2"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), audio.as_slice());
 
-        let response = request_query(&state, "/v1/requests/query", json!({"ids":["dup-id"]})).await;
-        let body: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(body["requests"][0]["cost_usd_nanos"].as_i64(), Some(9));
-        assert_eq!(body["missing"], json!([]));
+        let call = wait_for_call(&state, "req-integration-2").await;
+        assert_eq!(call.status, 200);
+        assert_eq!(call.characters, 7);
+        assert_eq!(call.cost_usd_nanos, 11_111 * 7);
+        assert_eq!(call.model.as_deref(), Some("qwen3-tts-flash"));
     }
 
     #[tokio::test]
-    async fn a_second_provider_absorbs_upstream_failures() {
-        let (upstream, records) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        seed_provider(&state, "provider-failing", FAILING_PROVIDER_KEY).await;
-        seed_provider(&state, "provider-healthy", "sk-provider-ok").await;
-
-        let response = crate::router(state.clone())
-            .oneshot(proxy_request(
-                "/v1/chat/completions",
-                json!({"model":"deepseek-flash","messages":[{"role":"user","content":"ping"}]}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(std::str::from_utf8(&body).unwrap().contains("pong"));
-
-        let recorded = records.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 2, "the request is retried once");
-        let keys = recorded
-            .iter()
-            .map(|record| {
-                record
-                    .headers
+    async fn a_rate_limited_provider_is_retried_and_then_cooled_down() {
+        let upstream = Router::new().route(
+            GENERATION_PATH,
+            post(move |headers: HeaderMap| async move {
+                let authorization = headers
                     .get(header::AUTHORIZATION)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_owned()
-            })
-            .collect::<Vec<_>>();
-        assert!(keys.contains(&format!("Bearer {FAILING_PROVIDER_KEY}")));
-        assert!(keys.contains(&"Bearer sk-provider-ok".to_owned()));
-        assert_ne!(keys[0], keys[1], "the retry uses a different provider");
-
-        let audits = wait_for_audits(&state, 1).await;
-        assert_eq!(
-            audits[0].get::<String, _>("provider_id"),
-            "provider-healthy"
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                if authorization == "Bearer sk-rate-limited" {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({"error": {"message": "rate limited"}})),
+                    )
+                        .into_response()
+                } else {
+                    Json(json!({
+                        "output": {"text": "ok"},
+                        "usage": {"duration": 1.0},
+                    }))
+                    .into_response()
+                }
+            }),
         );
-        assert_eq!(audits[0].get::<i64, _>("status"), 200);
-    }
+        let base = spawn_server(upstream);
+        let state = crate::test_state(&base).await;
+        seed_consumer_and_owner(&state, "user").await;
+        seed_provider(&state, "provider-a", "sk-rate-limited", "user").await;
+        seed_provider(&state, "provider-b", "sk-ok", "user").await;
+        state
+            .balancer
+            .pin_affinity(&state, "consumer-user:session", "provider-a");
 
-    #[tokio::test]
-    async fn models_outside_the_allowlist_are_rejected_before_the_upstream_call() {
-        let (upstream, records) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-        seed_provider(&state, "provider-1", "sk-provider-ok").await;
-
-        let response = crate::router(state.clone())
-            .oneshot(proxy_request(
-                "/v1/chat/completions",
-                json!({"model":"deepseek-v3-legacy","messages":[]}),
-            ))
-            .await
+        let boundary = "qwen-boundary";
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header(header::AUTHORIZATION, format!("Bearer {CONSUMER_SECRET}"))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .header("x-lb-affinity-key", "session")
+            .header("x-normai-request-id", "req-integration-3")
+            .body(Body::from(transcription_multipart(boundary)))
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = send(state.clone(), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(String::from_utf8_lossy(&body).contains("deepseek-v3-legacy"));
-        assert!(records.lock().unwrap().is_empty());
-
-        let audits = wait_for_audits(&state, 1).await;
-        assert_eq!(audits[0].get::<i64, _>("status"), 400);
-        assert_eq!(audits[0].get::<Option<String>, _>("provider_id"), None);
-    }
-
-    #[tokio::test]
-    async fn requests_without_credit_are_rejected_with_402() {
-        let (upstream, records) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        seed_consumer(&state, 0).await;
-        seed_provider(&state, "provider-1", "sk-provider-ok").await;
-
-        let response = crate::router(state.clone())
-            .oneshot(proxy_request(
-                "/v1/chat/completions",
-                json!({"model":"deepseek-flash","messages":[]}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        assert!(records.lock().unwrap().is_empty());
-        let audits = wait_for_audits(&state, 1).await;
-        assert_eq!(audits[0].get::<i64, _>("status"), 402);
-    }
-
-    #[tokio::test]
-    async fn an_empty_provider_pool_reports_unavailable() {
-        let (upstream, _) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-
-        let response = crate::router(state.clone())
-            .oneshot(proxy_request(
-                "/v1/chat/completions",
-                json!({"model":"deepseek-flash","messages":[]}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let audits = wait_for_audits(&state, 1).await;
-        assert_eq!(audits[0].get::<i64, _>("status"), 503);
         assert_eq!(
-            audits[0].get::<Option<String>, _>("error_code").as_deref(),
-            Some("provider_pool_empty")
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"text": "ok"})
         );
+
+        let call = wait_for_call(&state, "req-integration-3").await;
+        assert_eq!(call.provider_id.as_deref(), Some("provider-b"));
+        assert_eq!(call.status, 200);
+
+        state
+            .balancer
+            .maintain(&state.db, &state.write_gate)
+            .await
+            .unwrap();
+        let (status, cooldown_until): (String, Option<i64>) =
+            sqlx::query_as("SELECT status,cooldown_until FROM providers WHERE id='provider-a'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(status, "cooldown");
+        assert!(cooldown_until.is_some());
     }
 
     #[tokio::test]
-    async fn the_models_endpoint_lists_the_deepseek_family() {
-        let (upstream, _) = spawn_mock().await;
-        let state = crate::test_state(&upstream).await;
-        seed_consumer(&state, payments::USD_NANOS).await;
-
-        let mut request = Request::builder()
+    async fn missing_request_probe_reports_the_qwen_balancer() {
+        let state = crate::test_state("http://upstream.invalid").await;
+        seed_consumer_and_owner(&state, "user").await;
+        let request = Request::builder()
             .method("GET")
-            .uri("/v1/models")
+            .uri("/requests/probe-missing")
             .header(header::AUTHORIZATION, format!("Bearer {CONSUMER_SECRET}"))
             .body(Body::empty())
             .unwrap();
-        request
-            .extensions_mut()
-            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
-                [127, 0, 0, 1],
-                40_000,
-            ))));
-        let response = crate::router(state).oneshot(request).await.unwrap();
+        let response = send(state, request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["reason"], "request_not_found");
+        assert_eq!(value["error"]["lb"], "qwen");
+    }
+
+    #[tokio::test]
+    async fn request_cost_queries_return_settled_records_and_missing_ids() {
+        let state = crate::test_state("http://upstream.invalid").await;
+        seed_consumer_and_owner(&state, "user").await;
+        sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,model,status,latency_ms,audio_seconds,characters,cost_usd_nanos,created_at) VALUES('call-1','req-settled','consumer-user','user','POST','/v1/audio/transcriptions','qwen-audio-3.0-asr-flash',200,1,2.5,0,76390,unixepoch())")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/requests/query")
+            .header(header::AUTHORIZATION, format!("Bearer {CONSUMER_SECRET}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({"ids": ["req-settled", "req-missing"]})).unwrap(),
+            ))
+            .unwrap();
+        let response = send(state, request).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let value: Value = serde_json::from_slice(&body).unwrap();
-        let ids = value["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|model| model["id"].as_str().unwrap().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["deepseek-flash", "deepseek-v4-pro"]);
-        assert_eq!(value["data"][0]["owned_by"], "deepseek");
+        assert_eq!(value["requests"][0]["request_id"], "req-settled");
+        assert_eq!(value["requests"][0]["cost_usd_nanos"], 76_390);
+        assert_eq!(value["requests"][0]["audio_seconds"], 2.5);
+        assert_eq!(value["missing"], json!(["req-missing"]));
     }
 }
