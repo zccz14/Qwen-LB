@@ -44,6 +44,7 @@ import { AppLayout, type AppNavGroup } from "@zccz14/ux"
 import {
   ActivityIcon,
   ArrowDownUpIcon,
+  AudioLinesIcon,
   BookOpenIcon,
   BoxesIcon,
   CheckCircle2Icon,
@@ -56,24 +57,28 @@ import {
   ClipboardIcon,
   CpuIcon,
   DatabaseIcon,
+  DownloadIcon,
   ExternalLinkIcon,
   HardDriveIcon,
   KeyRoundIcon,
   LanguagesIcon,
   MemoryStickIcon,
+  MicIcon,
   NetworkIcon,
   PencilIcon,
   PlusIcon,
   RefreshCwIcon,
   ScrollTextIcon,
-  SearchIcon,
   ServerIcon,
   SettingsIcon,
   ShieldAlertIcon,
   ShieldCheckIcon,
   SlidersHorizontalIcon,
+  TagsIcon,
   Trash2Icon,
+  UploadIcon,
   UserRoundCogIcon,
+  Volume2Icon,
   WalletCardsIcon,
   XIcon,
   XCircleIcon,
@@ -127,13 +132,10 @@ import {
   FieldError,
   FieldGroup,
   FieldLabel,
-  FieldLegend,
-  FieldSet,
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { Separator } from "@/components/ui/separator"
 import {
   Select,
   SelectContent,
@@ -157,23 +159,14 @@ import {
 } from "@/components/ui/table"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
-import { ResponsesAPIRequestBodyRenderer } from "@/components/responses-api-request-body-renderer"
-import { api, type AuthSdk } from "@/lib/api"
+import {
+  api,
+  apiBlob,
+  apiFormWithHeaders,
+  isConsumerSecret,
+  type AuthSdk,
+} from "@/lib/api"
 import { cn } from "@/lib/utils"
-import {
-  codexPlatform,
-  codexProviderBlock,
-  isConsumerToken,
-  updateCodexConfig,
-  type CodexPlatform,
-} from "@/lib/codex-config"
-import {
-  dshModels,
-  updateDshCredentials,
-  updateDshSettings,
-} from "@/lib/dsh-config"
-import { updateOpenCodeConfig } from "@/lib/opencode-config"
-import { responseOutputText } from "@/lib/response-output"
 import {
   auditFilterSearch,
   auditFiltersFromSearch,
@@ -186,29 +179,23 @@ import {
 } from "@/lib/user-table-sort"
 import { midasTransferUrl, parseUsdNanos } from "@/lib/midas-transfer"
 import {
-  parseWebSearchBound,
-  parseWebSearchDomains,
-  webSearchDefaultMaxResults,
-  webSearchDefaultMaxUses,
-  webSearchMaxResultsLimit,
-  webSearchMaxUsesLimit,
-  webSearchRequestBody,
-  type WebSearchLocation,
-} from "@/lib/web-search"
+  defaultSpeechVoice,
+  isLanguageHint,
+  normalizeLanguageHint,
+  speechRequest,
+  transcriptionForm,
+} from "@/lib/voice"
 
 type Page =
   | "dashboard"
   | "providers"
   | "consumers"
-  | "codex-integration"
-  | "dsh-integration"
-  | "opencode-integration"
   | "direct-api-integration"
-  | "web-search"
+  | "voice"
   | "usage"
   | "audit"
   | "topups"
-  | "model-prices"
+  | "voice-prices"
   | "system-resources"
   | "admin-audit"
   | "provider-audit"
@@ -288,11 +275,9 @@ type Consumer = {
 type ProviderUsageStats = {
   requests: number
   errors: number
-  peak_requests: number
-  input_tokens: number
-  output_tokens: number
-  cached_tokens: number
-  actual_cost_usd_nanos: number
+  audio_seconds: number
+  characters: number
+  cost_usd_nanos: number
 }
 type Provider = {
   id: string
@@ -309,8 +294,7 @@ type Provider = {
   inflight: number
   queued: number
   concurrency_limit: number
-  official_provided_usd_nanos: number
-  actual_provided_usd_nanos: number
+  provided_usd_nanos: number
   usage?: ProviderUsageStats | null
 }
 const providerVisibilities = ["private", "public"] as const
@@ -328,20 +312,19 @@ function providerVisibilityLabel(
   }
 }
 
-type ProviderBalance = {
-  is_available?: boolean | null
-  balance_infos?: Array<{
-    currency?: string
-    total_balance?: string
-    granted_balance?: string
-    topped_up_balance?: string
-  }> | null
+type ProviderTestResult = {
+  ok: boolean
+  status?: number | null
+  latency_ms?: number
+  model_count?: number
+  has_default_transcription_model?: boolean
+  has_default_speech_model?: boolean
+  error?: string | null
 }
 type ProviderTestState = {
   provider: Provider
   status: "loading" | "success" | "error"
-  latency_ms?: number
-  model?: string
+  result?: ProviderTestResult
   error?: string
 }
 type DashboardStats = {
@@ -349,16 +332,12 @@ type DashboardStats = {
   active_providers: number
   calls_24h: number
   errors_24h: number
-  peak_calls_24h: number
-  input_tokens_24h: number
-  output_tokens_24h: number
-  cached_tokens_24h: number
-  official_cost_usd_nanos_24h: number
-  actual_cost_usd_nanos_24h: number
-  official_consumed_usd_nanos: number
+  audio_seconds_24h: number
+  characters_24h: number
+  cost_usd_nanos_24h: number
   consumed_usd_nanos: number
-  peak_now: boolean
-  available_model_ids: string[]
+  transcription_model_ids: string[]
+  speech_model_ids: string[]
 }
 type UsagePeriod = "24h" | "7d"
 type UsageRow = {
@@ -369,24 +348,15 @@ type UsageRow = {
   model: string
   date: string
   requests: number
-  input_tokens: number
-  cached_tokens: number
-  output_tokens: number
+  audio_seconds: number
+  characters: number
   network_transport_bytes: number
-  official_cost_usd_nanos: number
-  actual_cost_usd_nanos: number
-  peak_requests: number
+  cost_usd_nanos: number
 }
 type UsageResponse = { period: UsagePeriod; since: number; rows: UsageRow[] }
 type PivotCell = Pick<
   UsageRow,
-  | "requests"
-  | "input_tokens"
-  | "cached_tokens"
-  | "output_tokens"
-  | "network_transport_bytes"
-  | "official_cost_usd_nanos"
-  | "actual_cost_usd_nanos"
+  "requests" | "audio_seconds" | "characters" | "network_transport_bytes" | "cost_usd_nanos"
 >
 type PivotTableRow = {
   id: string
@@ -403,9 +373,8 @@ type Audit = {
   provider_id?: string
   provider_name?: string
   path: string
+  method: string
   model?: string
-  reasoning_effort?: string
-  peak: boolean
   status: number
   first_byte_latency_ms?: number
   request_bytes: number
@@ -413,20 +382,13 @@ type Audit = {
   request_transport_bytes: number
   response_transport_bytes: number
   latency_ms: number
-  input_tokens: number
-  output_tokens: number
-  cached_tokens: number
-  official_cost_usd_nanos: number
-  actual_cost_usd_nanos: number
-  price_multiplier_nanos: number
-  official_consumed_usd_before_nanos: number
-  official_consumed_usd_after_nanos: number
-  actual_consumed_usd_before_nanos: number
-  actual_consumed_usd_after_nanos: number
-  official_provided_usd_before_nanos: number
-  official_provided_usd_after_nanos: number
-  actual_provided_usd_before_nanos: number
-  actual_provided_usd_after_nanos: number
+  audio_seconds: number
+  characters: number
+  cost_usd_nanos: number
+  consumed_usd_before_nanos: number
+  consumed_usd_after_nanos: number
+  provided_usd_before_nanos: number
+  provided_usd_after_nanos: number
   error_code?: string | null
   error?: string
   created_at: number
@@ -439,7 +401,6 @@ type AuditDetail = Audit & {
   downstream_content_encoding?: string
   upstream_accept_encoding?: string
   upstream_content_encoding?: string
-  method: string
   client_ip?: string
   affinity_hash?: string
   affinity_source?: string
@@ -472,9 +433,9 @@ type ProviderAuditRow = {
   requests: number
   successful_requests: number
   failed_requests: number
-  input_tokens: number
-  actual_cost_usd_nanos: number
-  peak_requests: number
+  audio_seconds: number
+  characters: number
+  cost_usd_nanos: number
   success_rate: number
   failure_rate: number
 }
@@ -484,19 +445,22 @@ type ProviderAuditResponse = {
   until: number
   rows: ProviderAuditRow[]
 }
+type TranscriptionModelRate = { model: string; price_usd_per_second: string }
+type SpeechModelRate = { model: string; price_usd_per_character: string }
 type SettingsData = {
   role: Role
   auth_issuer?: string
   auth_audience?: string
   upstream_base: string
-  available_model_ids: string[]
-  web_search_model: string
+  transcription_models: TranscriptionModelRate[]
+  default_transcription_model: string
+  speech_models: SpeechModelRate[]
+  default_speech_model: string
   allow_all_users_debt: boolean
   response_body_limit: number
   affinity_ttl_seconds: number
   provider_concurrency_limit: number
   request_archive_retention_days: number
-  model_price_multiplier: string
   midas_api_base?: string
   midas_fund_user_id?: string | null
   midas_fund_api_key_configured?: boolean
@@ -504,7 +468,6 @@ type SettingsData = {
 type PaymentSummary = {
   topup_usd_nanos: number
   available_usd_nanos: number
-  official_consumed_usd_nanos: number
   consumed_usd_nanos: number
   provided_usd_nanos: number
   enforcement_enabled: boolean
@@ -516,1149 +479,918 @@ type MidasSettingsData = {
   midas_fund_user_id?: string
   midas_fund_api_key_configured: boolean
 }
-type ModelPriceRates = {
-  cache_hit_usd_nanos: number
-  cache_miss_usd_nanos: number
-  output_usd_nanos: number
-}
-type ModelPrice = {
-  model: string
-  peak: ModelPriceRates
-  off_peak: ModelPriceRates
-}
-type ModelPricesResponse = {
-  source_url: string
-  source_as_of: string
+type AudioPricesResponse = {
   unit: string
-  rows: ModelPrice[]
+  transcription: TranscriptionModelRate[]
+  speech: SpeechModelRate[]
 }
 const copy = {
   zh: {
-    dashboard: "总览",
-    providers: "上游提供商",
-    consumers: "下游消费者",
-    "codex-integration": "Codex",
-    "dsh-integration": "DSH（DeepSeek Harness）",
-    "opencode-integration": "OpenCode",
+    "dashboard": "总览",
+    "providers": "上游提供商",
+    "consumers": "下游消费者",
     "direct-api-integration": "直接 API",
-    "web-search": "联网搜索",
-    usage: "用量",
-    audit: "推理审计",
-    topups: "充值",
-    "model-prices": "模型价格",
+    "voice": "语音工坊",
+    "usage": "用量",
+    "audit": "推理审计",
+    "topups": "充值",
+    "voice-prices": "语音计价",
     "system-resources": "系统资源",
     "admin-audit": "管理审计",
     "provider-audit": "提供商审计",
-    users: "用户",
-    settings: "设置",
-    title: "DeepSeek-LB",
-    subtitle: "DeepSeek API 反向代理与负载均衡器",
-    navigationWorkspace: "工作区",
-    navigationIntegrations: "下游接入",
-    navigationTools: "工具",
-    navigationData: "数据",
-    navigationAdministration: "管理员",
-    english: "English",
-    roleLoading: "加载中",
-    continueAuthMini: "前往 Auth Mini 登录",
-    loading: "正在加载 DeepSeek-LB…",
-    pageDashboard: "查看当前账户的 24 小时运行摘要。",
-    pageProviders:
-      "管理自己拥有的 DeepSeek 上游提供商、运行状态与近 7 天用量。",
-    pageConsumers: "按 AI App 隔离下游消费者，分别跟踪调用量并独立吊销凭据。",
-    pageCodexIntegration:
-      "手动或授权浏览器配置本机 Codex 文件，并使用独立的下游 Consumer。",
-    pageDshIntegration:
-      "手动或授权浏览器自动配置本机 DSH，并为它创建独立的下游 Consumer。",
-    pageOpenCodeIntegration:
-      "手动或授权浏览器配置本机 OpenCode 文件，并使用独立的下游 Consumer。",
-    pageDirectApiIntegration:
-      "使用独立的下游 Consumer 经 DeepSeek-LB 调用 DeepSeek API。",
-    pageWebSearch:
-      "用一次 DeepSeek 原生联网搜索检索来源，并核对本次调用的用量与费用；下游 AI App 用 Consumer 调用 /v1/web-search 的同一能力。",
-    pageUsage: "按消费者核算请求、Token、官方费用与实际费用。",
-    pageAudit:
-      "逐次追踪推理请求、上游提供商、费用快照与累计消费；诊断内容按配置期限保留。",
-    pageTopups: "通过 Midas 管理入金、协议授权与可用额度。",
-    pageModelPrices:
-      "查看 DeepSeek 官方标准 Token 价格快照，价格按每百万 Token 展示。",
-    pageSystemResources:
-      "查看宿主机当前负载和 DeepSeek-LB 数据占用；仅 root 和管理员可访问。",
-    pageAdminAudit: "查看 root 与管理员执行的管理操作记录。",
-    pageProviderAudit:
-      "按上游提供商、模型和小时查看最近 7 天请求成功与失败情况。",
-    pageRequestDetail: "查看调用上下文、消息结构与同一 Thread ID 的相邻请求。",
-    pageUsers:
-      "由 root 管理本地角色与全局 Provider 权限；用户身份仍由 Auth Mini 提供。",
-    pageSettings: "确认身份边界、上游与部署限制。",
-    webSearchQuery: "搜索查询",
-    webSearchQueryPlaceholder: "例如：DeepSeek V4 发布日期",
-    webSearchModel: "搜索模型",
-    webSearchMaxResults: "来源上限",
-    webSearchMaxResultsHelp:
-      "1 到 50 之间的整数。DeepSeek 没有结果数量参数，超出上限的来源会在返回时按 URL 去重后截断。",
-    webSearchMaxResultsInvalid: "请输入 1 到 50 之间的整数。",
-    webSearchMaxUses: "搜索次数上限",
-    webSearchMaxUsesHelp:
-      "1 到 5 之间的整数，即这一轮里 DeepSeek 最多执行多少次服务端搜索；次数越多，推理 Token 与费用越高。",
-    webSearchMaxUsesInvalid: "请输入 1 到 5 之间的整数。",
-    webSearchAllowedDomains: "仅限这些域名",
-    webSearchBlockedDomains: "排除这些域名",
-    webSearchDomainsPlaceholder: "example.com, deepseek.com",
-    webSearchDomainsHelp:
-      "逗号或空白分隔的裸域名，子域名自动包含；两种过滤方式只能用一种。",
-    webSearchDomainsConflict: "仅限域名与排除域名不能同时使用。",
-    webSearchLocation: "定位用户位置",
-    webSearchLocationHelp:
-      "可选，用近似位置帮助搜索返回本地相关结果；留空则不下发位置。",
-    webSearchLocationCountry: "国家",
-    webSearchLocationRegion: "地区",
-    webSearchLocationCity: "城市",
-    webSearchLocationTimezone: "时区",
-    webSearchRun: "开始搜索",
-    webSearching: "正在搜索",
-    webSearchResultsTitle: "搜索结果",
-    webSearchResultsDescription: "搜索结果按 URL 去重，附标题、时效与引用摘录。",
-    webSearchEmpty: "执行搜索后，搜索词与来源会显示在这里。",
-    webSearchFailed: "联网搜索失败",
-    webSearchQueries: "搜索词",
-    webSearchSources: "来源",
-    webSearchTruncated: "已按上限截断",
-    webSearchUsage: "本次用量",
-    webSearchInputTokens: "输入 Token",
-    webSearchOutputTokens: "输出 Token",
-    webSearchCachedTokens: "缓存 Token",
-    webSearchCostNote:
-      "每次搜索以一次模型轮次计费，费用与用量记入推理审计，可用模型筛选项按搜索模型回看。",
-    webSearchAuditLink: "在推理审计中查看该模型的调用",
-    webSearchSettingsTitle: "联网搜索",
-    webSearchSettingsDescription:
-      "宿主模型执行每次搜索的完整轮次，因此选择哪个模型决定了搜索费用。",
-    webSearchModelLabel: "搜索模型",
-    webSearchModelHelp:
-      "使用 DeepSeek Anthropic 兼容接口的模型名，例如 deepseek-flash；搜索请求发往上游基址下的 /anthropic/v1/messages。",
-    webSearchModelInvalid: "搜索模型需为 1-200 个字符。",
-    webSearchEndpoint: "搜索端点",
-    accountOverview: "本账户运行概要",
-    accountOverviewDescription: "当前账户的运行状态、调用与 Token 用量。",
-    tokenUsage24h: "24 小时 Token 用量",
-    tokenUsage24hDescription:
-      "已审计请求的输入、输出与缓存 Token 汇总；缓存率 = 缓存输入 Token / 输入 Token，输入输出比 = 输入 Token / 输出 Token。",
-    cacheRate: "缓存率",
-    inputOutputRatio: "输入输出比",
-    activeConsumers: "有效消费者",
-    calls24h: "24 小时调用",
-    errors24h: "24 小时错误",
-    officialCost24h: "24 小时官方费用 (USD)",
-    actualCost24h: "24 小时实际费用 (USD)",
-    officialConsumedUsd: "官方累计费用 (USD)",
-    actualConsumedUsd: "实际累计消费 (USD)",
-    providedValue: "累计提供价值 (USD)",
-    officialCost: "官方费用 (USD)",
-    actualCost: "实际费用 (USD)",
-    priceMultiplier: "价格倍率",
-    officialConsumedUsdBefore: "官方累计费用前 (USD)",
-    officialConsumedUsdAfter: "官方累计费用后 (USD)",
-    actualConsumedUsdBefore: "实际累计消费前 (USD)",
-    actualConsumedUsdAfter: "实际累计消费后 (USD)",
-    officialProvidedUsdBefore: "上游官方累计提供价值前 (USD)",
-    officialProvidedUsdAfter: "上游官方累计提供价值后 (USD)",
-    actualProvidedUsdBefore: "上游实际累计提供价值前 (USD)",
-    actualProvidedUsdAfter: "上游实际累计提供价值后 (USD)",
-    topupsTitle: "充值与额度",
-    topupsDescription:
-      "可用额度 = Midas 公共账户累计转入 + 累计提供价值 - 累计消费。",
-    creditedUsd: "累计充值 (USD)",
-    usageUsd: "累计消费 (USD)",
-    availableCredit: "可用额度 (USD)",
-    cumulativeTopups: "累计充值 (USD)",
-    cumulativeConsumption: "累计消费 (USD)",
-    requestNotEnforced: "当前不因可用额度不足拦截请求。",
-    requestEnforced: "可用额度不足时会拦截请求。",
-    midasFundTitle: "转入 DeepSeek-LB 公共账户",
-    midasFundDescription:
-      "输入金额后，Midas 会在新窗口中显示不可编辑的收款账户和金额；登录并确认后，即可完成充值。",
-    topupAmount: "充值金额 (USD)",
-    topupAmountHint: "最多 9 位小数。Midas 将按精确 USD 纳美元金额转账。",
-    continueToMidas: "继续前往 Midas",
-    publicWalletUserId: "DeepSeek-LB 公共账户用户 ID",
-    copyMidasUserId: "复制用户 ID",
-    midasTransferRefresh:
-      "完成转账后刷新本页，累计充值会从 Midas 当前累计转入中显示。",
-    midasUnavailable: "Midas 尚未配置",
-    midasUnavailableDescription:
-      "请由 root 在设置中填写 Midas 公共账户用户 ID 与 fund API key。",
-    midasSettings: "Midas",
-    midasSettingsDescription:
-      "Midas 是充值唯一账本。公共账户 user ID 可安全展示给付款用户；fund API key 仅保存在服务器 SQLite 中，留空会保留现有密钥。",
-    midasApiBase: "API 地址",
-    midasFundUserId: "公共账户 User ID",
-    midasFundApiKey: "Fund API key",
-    midasConfigured: "已配置",
-    midasNotConfigured: "未配置",
-    midasSettingsSaved: "Midas 设置已保存",
-    modelPricesTitle: "DeepSeek 官方价格",
-    modelPricesDescription:
-      "用于费用核算的 DeepSeek 官方价格快照，单位为美元/百万 Token；高峰与非高峰两档并列。",
-    pricingUnit: "计价单位",
-    pricingAsOf: "价格快照日期",
-    officialPricingSource: "打开 DeepSeek 官方价格页",
-    officialModelPriceTable: "Token 价格",
-    modelPricesTableDescription:
-      "按高峰（peak）与非高峰（off-peak）分别列示。非高峰为高峰价格的 50%，中国法定节假日全天按非高峰计费。",
-    activeProviders: "可用上游提供商",
-    peakCalls24h: "峰时请求（24 小时）",
-    pricingTariffTitle: "当前计费时段",
-    pricingTariffDescription:
-      "DeepSeek 分高峰与非高峰两档计费：非高峰价格为高峰的 50%，中国法定节假日全天按非高峰计费。",
-    pricingPeak: "高峰",
-    pricingTariff: "计费时段",
-    pricingOffPeak: "非高峰",
-    pricingModels: "可用模型",
-    cacheHitTokens: "命中缓存",
-    cacheMissTokens: "未命中缓存",
-    systemResources: "系统资源",
-    systemResourcesDescription:
-      "宿主机当前负载与 DeepSeek-LB 数据占用，仅 root 和管理员可见。",
-    refreshEvery5s: "每 5 秒刷新",
-    sampledAt: "采样于",
-    resourceUnavailable: "无法读取系统资源",
-    resourceUnavailableDescription: "自动刷新会继续重试，无需重新加载页面。",
-    cpu: "CPU",
-    memory: "内存",
-    network: "网络",
-    disk: "磁盘",
-    sqlite: "SQLite 数据库",
-    load1m: "1 分钟负载",
-    logicalCpus: "逻辑核心",
-    available: "可用",
-    lbRss: "DeepSeek-LB RSS",
-    otherSystemMemory: "其他系统占用",
-    systemAvailableMemory: "系统可用内存",
-    swap: "Swap",
-    received: "接收",
-    transmitted: "发送",
-    totalReceived: "累计接收",
-    totalTransmitted: "累计发送",
-    networkInterfaces: "网络接口",
-    mountPoint: "挂载点",
-    mainFile: "主文件",
-    walFile: "WAL",
-    shmFile: "SHM",
-    reclaimableSpace: "可回收空间（VACUUM）",
-    vacuumDatabase: "执行 VACUUM",
-    vacuumDatabaseTitle: "整理 SQLite 数据库？",
-    vacuumDatabaseDescription:
-      "此操作会重写数据库文件以回收可回收空间。执行期间数据库写入可能短暂等待。",
-    vacuumDatabaseComplete: "SQLite 数据库已整理，资源指标已刷新。",
-    providerPool: "上游提供商池",
-    providerDescription:
-      "每个上游提供商就是一个 DeepSeek API Key。私有提供商只有你自己的 Consumer 可以使用，公开提供商对所有 Consumer 开放。",
-    providerApiKey: "DeepSeek API Key",
-    providerApiKeyHelp:
-      "DeepSeek 平台签发的 API Key，保存在本机 SQLite 中，只有 root 与管理员可以再次读取。",
-    providerApiKeyInvalid: "API Key 需要以 sk- 开头且不含空白字符。",
-    providerKeyTitle: "上游提供商 API Key",
-    providerKeyDescription:
-      "读取或替换该提供商的 DeepSeek API Key。更换后调度池会立即使用新 Key。",
-    providerKeySaved: "上游提供商 API Key 已保存",
-    saveProviderKey: "保存 API Key",
-    providerEnable: "启用",
-    providerDisable: "停用",
-    providerLastError: "最近错误",
-    providerCooldownUntil: "冷却至",
-    providerUsage7d: "近 7 天用量",
-    providerUsageRequests: "请求",
-    providerUsageErrors: "失败",
-    providerUsageCost: "费用",
-    providerNoUsage: "近 7 天没有请求",
-    providerTestTitle: "上游连通性测试",
-    providerTestDescription:
-      "服务端使用该提供商的 API Key 向 DeepSeek 发送一次最小请求，Key 不会返回浏览器。",
-    providerTestResult: "结果",
-    providerTestSucceeded: "连通正常",
-    providerTestFailed: "上游返回错误",
-    providerTestModel: "测试模型",
-    providerTestLatency: "耗时",
-    providerBalance: "余额",
-    providerBalanceTitle: "上游余额",
-    providerBalanceDescription:
-      "直接读取 DeepSeek 账户余额；余额为 0 时该提供商会返回 402 并暂停调度。",
-    providerBalanceAvailable: "可继续调用",
-    providerBalanceUnavailable: "DeepSeek 未返回余额信息。",
-    yes: "是",
-    no: "否",
-    addProvider: "添加上游提供商",
-    noProviders: "尚无上游提供商",
-    noProvidersDescription:
-      "点击“添加上游提供商”，填入 DeepSeek 平台签发的 API Key，即可加入调度池。",
-    name: "名称",
-    owner: "所有者",
-    status: "状态",
-    actions: "操作",
-    refresh: "刷新",
-    providerUpdated: "上游提供商已更新",
-    providerAdded: "上游提供商已添加",
-    addProviderTitle: "添加上游提供商",
-    nameOptional: "名称（可选）",
-    providerNameHelp: "留空时使用提供商 UUID。",
-    providerVisibility: "可见性",
-    providerVisibilityPrivate: "私有",
-    providerVisibilityPublic: "公开",
-    providerVisibilityHelp:
-      "私有：只有本用户名下的 Consumer 可以使用该上游提供商。公开：所有 Consumer 都可以使用。",
-    makeProviderPublic: "改为公开",
-    makeProviderPrivate: "改为私有",
-    editProviderName: "编辑提供商名称",
-    saveProviderName: "保存提供商名称",
-    cancelProviderName: "取消编辑提供商名称",
-    deleteProvider: "删除",
-    deleteProviderTitle: "删除上游提供商？",
-    deleteProviderDescription:
-      "此操作会将上游提供商从管理列表和调度池中隐藏。其 API Key、亲和性及历史记录都会保留。",
-    confirmDeleteProvider: "隐藏上游提供商",
-    providerDeleted: "上游提供商已隐藏",
-    testProvider: "测试",
-    testingProvider: "正在测试上游连通性…",
-    consumersTitle: "租户消费者",
-    consumersDescription:
-      "每个 AI App 建议使用一个独立消费者；这样用量、错误和密钥轮换都能按 App 隔离。消费者凭据只在创建或轮换后显示一次。",
-    create: "创建",
-    noConsumers: "尚无消费者",
-    noConsumersDescription:
-      "为每个 AI App 创建一个独立消费者，再开始调用代理。",
-    prefix: "前缀",
-    apiKey: "API KEY",
-    createdAt: "创建时间",
-    lastUsed: "最近使用",
-    requestArchive: "诊断入库",
-    requestArchiveHelp:
-      "打开后，该 Consumer 的请求/响应诊断预览才会保存到 SQLite。",
-    requestArchiveUpdated: "诊断入库开关已更新",
-    consumerEnabled: "消费者已启用",
-    consumerDisabledUpdated: "消费者状态已更新",
-    rotateConsumer: "轮换并复制",
-    rotateConsumerTitle: "轮换 API KEY？",
-    rotateConsumerDescription:
-      "轮换后当前 API KEY 会立即失效，并将新的 API KEY 复制到剪贴板。确定继续吗？",
-    confirmRotateConsumer: "确认轮换",
-    consumerRotated: "新的 API 密钥已复制到剪贴板",
-    consumerRotateCopyFailed:
-      "API 密钥已轮换，但无法复制到剪贴板。请再次轮换后重试。",
-    editConsumer: "编辑",
-    editConsumerAriaLabel: "编辑消费者",
-    saveConsumer: "保存",
-    consumerUpdated: "消费者已更新",
-    deleteConsumer: "删除",
-    deleteConsumerTitle: "删除消费者？",
-    deleteConsumerDescription:
-      "此操作会从列表和鉴权中隐藏该消费者。所有调用记录和已保存的诊断内容都会保留。",
-    confirmDeleteConsumer: "删除消费者",
-    consumerDeleted: "消费者已删除，历史已保留",
-    cancel: "取消",
-    consumerAppHelp:
-      "请为每个 AI App 单独创建一个消费者，并用 App 名称命名，便于隔离用量、排障和密钥轮换。",
-    saveConsumerTitle: "立即保存消费者",
-    saveConsumerDescription:
-      "关闭后无法再次查看。不要将它写入浏览器代码、日志或聊天记录。",
-    savedConsumer: "我已安全保存",
-    copied: "已复制",
-    usageTitle: "用量透视",
-    usageDescription:
-      "按用户、脱敏 API Token、模型和日期交叉汇总请求 Token、官方费用与实际费用。",
-    noUsage: "暂无用量",
-    noUsageDescription: "在所选时间段发起 API 调用后，这里会按维度汇总 Token。",
-    requests: "请求",
-    errors: "错误",
-    last24Hours: "最近 24 小时",
-    last7Days: "最近 7 天",
-    allUsers: "全部用户",
-    allConsumers: "全部消费者",
-    allModels: "全部模型",
-    userLabel: "用户",
-    model: "模型",
-    consumerLabel: "消费者",
-    date: "日期",
-    rows: "行",
-    columns: "列",
-    data: "数据",
-    hidden: "隐藏",
-    inputTokens: "输入 Token",
-    cachedInputTokens: "缓存输入 Token",
-    outputTokens: "输出 Token",
-    requestCount: "请求次数",
-    usageRows: "条聚合记录",
-    sortColumn: "排序",
-    total: "总计",
-    clearFilters: "清除筛选",
-    pivotFields: "透视字段",
-    dataOrder: "数据列顺序",
-    auditTitle: "推理审计",
-    auditDescription:
-      "请求/响应诊断预览保存在 SQLite；不记录 Authorization 或上游 API Key。",
-    noAudit: "暂无推理审计记录",
-    noAuditDescription: "每次推理调用结束后都会写入基础审计记录。",
-    time: "时间",
-    requestId: "请求 ID",
-    threadId: "Thread ID",
-    copyThreadId: "复制 Thread ID",
-    provider: "上游提供商",
-    firstByteLatency: "首字节",
-    totalLatency: "总耗时",
-    requestSize: "请求大小",
-    responseSize: "响应大小",
-    requestTransportSize: "请求传输量（压缩后）",
-    responseTransportSize: "响应传输量（压缩后）",
-    compressionRatio: "压缩率",
-    downstreamAcceptEncoding: "下游接受压缩",
-    downstreamContentEncoding: "下游响应压缩",
-    upstreamAcceptEncoding: "上游请求压缩",
-    upstreamContentEncoding: "上游响应压缩",
-    networkTransport: "网络传输量（压缩后）",
-    reasoningEffort: "推理强度",
-    cachedInput: "缓存输入",
-    details: "详情",
-    filter: "筛选",
-    filterUserId: "用户 ID",
-    filterConsumer: "消费者",
-    filterProvider: "提供商",
-    filterModel: "模型",
-    errorCode: "错误码",
-    errorMessage: "错误信息",
-    allStatuses: "全部状态",
-    successfulCalls: "成功",
-    failedCalls: "失败",
-    auditResults: "条调用",
-    page: "第",
-    previousPage: "上一页",
-    nextPage: "下一页",
-    requestDetail: "请求详情",
-    requestSummary: "请求概要",
-    backToAudit: "返回推理审计",
-    requestHeaders: "请求头",
-    requestBody: "请求正文",
-    responseHeaders: "响应头",
-    headerSnapshotMissing: "未采集",
-    headerComparisonUnavailable: "缺少一侧的头信息，无法比较差异。",
-    responseBody: "响应正文",
-    tokenUsage: "Token 用量",
-    cacheHitRate: "缓存命中率",
-    upstreamHttpProtocol: "上游 HTTP 协议",
-    httpStatusCode: "HTTP 状态码",
-    finalResponse: "最终回复",
-    finalResponseUnavailable: "响应正文中未找到 response.output。",
-    diagnosticData: "请求与响应正文",
-    diagnosticDataDescription:
-      "仅在该 Consumer 开启诊断入库时保存；敏感凭据不会记录。",
-    deleteAuditBodies: "删除请求/响应正文",
-    deleteAuditBodiesTitle: "删除请求和响应正文？",
-    deleteAuditBodiesDescription:
-      "此操作不可撤销。调用状态、用量和请求/响应头诊断将保留。",
-    confirmDeleteAuditBodies: "删除正文",
-    auditBodiesDeleted: "请求/响应正文已删除",
-    auditBodiesDeletedDescription:
-      "此审计记录的请求与响应正文已永久删除；调用状态、用量和请求/响应头诊断仍会保留。",
-    headerName: "头字段",
-    downstreamToLb: "下游 → LB",
-    lbToUpstream: "LB → 上游",
-    upstreamToLb: "上游 → LB",
-    lbToDownstream: "LB → 下游",
-    different: "不同",
-    previewTruncated: "预览已截断",
-    affinitySource: "亲和来源",
-    affinityRequestId: "亲和请求 ID",
-    affinityHash: "亲和哈希",
-    previousRequest: "上一个请求",
-    nextRequest: "下一个请求",
-    tools: "工具",
-    identityPermissions: "身份与权限",
-    identityDescription: "浏览器会话由 Auth Mini 管理；后端只验证 access JWT。",
-    proxyBoundary: "代理边界",
-    proxyDescription: "仅代理 DeepSeek 能力，不提供其他厂商兼容协议。",
-    unableLoad: "无法加载",
-    unknownError: "未知错误",
-    close: "关闭",
-    inflight: "处理中",
-    providerLoad: "处理中 / 上限",
-    providerQueued: "排队中",
-    providerConcurrency: "上游并发控制",
-    providerConcurrencyDescription:
-      "统一设置每个上游提供商的并发上限，默认为 3。",
-    providerConcurrencyLimit: "每个提供商的并发上限",
-    providerConcurrencyHelp:
-      "从路由到提供商起计数，直到响应结束或请求取消，流式响应包含在内。超出上限的请求按先后顺序排队。保存后立即生效；降低上限不会中断正在处理的请求。",
-    providerConcurrencyInvalid: "请输入大于 0 的整数。",
-    consumer: "消费者",
-    input: "输入",
-    output: "输出",
-    userId: "用户 ID",
-    role: "角色",
-    authIssuer: "认证签发方",
-    upstream: "上游",
-    bodyLimit: "请求体限制",
-    affinityTtl: "亲和 TTL",
-    upstreamHint: "DeepSeek API 基址，默认 https://api.deepseek.com。",
-    archiveRetention: "请求与响应诊断记录保留天数",
-    statusActive: "可用",
-    statusCooldown: "冷却中",
-    statusAuthError: "认证错误",
-    statusDisabled: "已禁用",
-    statusUnknown: "未知",
-    roleRoot: "超级管理员",
-    roleAdmin: "管理员",
-    roleUser: "租户用户",
-    adminAuditTitle: "管理操作审计",
-    adminAuditDescription:
-      "记录 root 与管理员执行的提供商、密钥、系统与审计管理操作。",
-    providerAuditTitle: "提供商审计",
-    providerAuditDescription:
-      "按上游提供商、模型和小时汇总请求结果，帮助定位失败集中在哪个上游或模型。",
-    providerAuditChartDescription:
-      "当前筛选范围内按小时观察失败率、请求数和输入 Token。",
-    providerAuditFailureRateChart: "时间—失败率",
-    providerAuditRequestCountChart: "时间—请求数",
-    providerAuditInputTokensChart: "时间—Input Token 数",
-    providerAuditPeriod: "数据范围",
-    providerAuditTableDescription:
-      "每行代表一个小时、一个上游提供商和一个模型。",
-    providerAuditNoData: "所选时间范围暂无请求",
-    providerAuditNoDataDescription:
-      "产生请求后，这里会按小时显示各个上游和模型的结果。",
-    providerAuditAllProviders: "全部提供商",
-    providerAuditUnknownProvider: "未识别提供商",
-    providerAuditHour: "小时",
-    providerAuditSuccessRate: "成功率",
-    providerAuditFailureRate: "失败率",
-    providerAuditSuccessfulRequests: "成功请求",
-    providerAuditFailedRequests: "失败请求",
-    providerAuditTotalRequests: "请求总数",
-    providerAuditInputTokens: "Input Token 数",
-    administrator: "操作用户",
-    action: "操作",
-    target: "目标",
-    clientIp: "客户端 IP",
-    setupTitle: "初始化 DeepSeek-LB",
-    setupDescription: "连接品牌 Auth Mini，并将首个已验证用户绑定为唯一 root。",
-    setupIssuer: "Auth Mini issuer",
-    setupIssuerHelp:
-      "填写品牌提供的 Auth Mini HTTPS 地址。DeepSeek-LB 只连接该实例，不会部署或管理它。",
-    setupAudience: "JWT audience",
-    setupAudienceHelp:
-      "本应用自身的 audience（通常为站点域名）；登录会同时申请 linkit.ntnl.io，供控制台的 Linkit 集成使用。",
-    connectAuth: "连接 Auth Mini",
-    setupLogin: "验证 root 身份",
-    setupLoginHelp:
-      "登录成功后，当前 Auth Mini user_id 将成为 DeepSeek-LB root。",
-    finishSetup: "绑定 root 并完成初始化",
-    finishingSetup: "正在完成初始化",
-    setupStepConnect: "连接认证实例",
-    setupAuthenticated: "身份已验证",
-    setupSecurity:
-      "Setup 完成后初始化入口会立即关闭；后续登录用户默认为 user。",
-    usersTitle: "用户与请求权限",
-    usersDescription:
-      "所有用户默认可以使用全局 Provider，但仅能查看和管理自己拥有的 Provider；管理员和 root 可以查看全部。列表显示每位用户的累计充值、累计消费、累计提供价值与可用额度。允许欠费的用户可在余额用尽后继续发送请求。",
-    noUsers: "暂无用户",
-    noUsersDescription: "用户首次通过 Auth Mini 登录后会自动出现在这里。",
-    roleUpdated: "用户角色已更新",
-    allowDebt: "允许欠费",
-    allowDebtUpdated: "允许欠费设置已更新",
-    runtimeSettings: "运行配置",
-    runtimeSettingsDescription:
-      "这些值保存在 SQLite app_meta 中；地址与模型立即生效，请求体上限重启后生效。",
-    availableModels: "可用模型",
-    availableModelsDescription:
-      "控制下游可调用的模型。此列表会立即同步到 /v1/models、模型价格页和 Responses 请求校验。",
-    availableModelsHelp: "每行填写一个 Model ID；留空或重复的 ID 无法保存。",
-    availableModelsSaved: "可用模型已保存",
-    availableModelsRequired: "请至少填写一个 Model ID",
-    modelPriceMultiplier: "默认价格倍率",
-    modelPriceMultiplierHint:
-      "未来请求按官方费用乘以此倍率计费；每条请求都会保存当时的倍率快照。",
-    allowAllUsersDebt: "允许所有人欠费",
-    allowAllUsersDebtHint: "打开后，所有用户均可在可用额度不足时继续发送请求。",
-    saveSettings: "保存配置",
-    settingsSaved: "配置已保存",
-    responseLimit: "请求体与响应预览上限 (bytes)",
+    "users": "用户",
+    "settings": "设置",
+    "requestDetail": "请求详情",
+    "title": "Qwen-LB",
+    "subtitle": "Qwen 语音 API 反向代理与负载均衡器",
+    "navigationWorkspace": "工作区",
+    "navigationIntegrations": "下游接入",
+    "navigationTools": "工具",
+    "navigationData": "数据",
+    "navigationAdministration": "管理员",
+    "english": "English",
+    "roleLoading": "加载中",
+    "continueAuthMini": "前往 Auth Mini 登录",
+    "loading": "正在加载 Qwen-LB…",
+    "pageDashboard": "查看当前账户的 24 小时运行摘要。",
+    "pageProviders": "管理自己拥有的 Qwen 上游提供商、运行状态与近 7 天用量。",
+    "pageConsumers": "按 AI App 隔离下游消费者，分别跟踪调用量并独立吊销凭据。",
+    "pageDirectApiIntegration": "使用独立的下游 Consumer 直接调用 Qwen 语音接口。",
+    "pageVoice": "在控制台试用一次转写或语音合成，无需自行准备 Consumer 凭据。",
+    "pageUsage": "按消费者核算请求、音频时长、字符数与费用。",
+    "pageAudit": "逐次追踪语音调用、上游提供商、费用快照与累计消费；诊断内容按配置期限保留。",
+    "pageTopups": "通过 Midas 管理入金、协议授权与可用额度。",
+    "pageVoicePrices": "查看当前生效的语音单价；价格与默认模型可在设置中调整。",
+    "pageSystemResources": "查看宿主机当前负载和 Qwen-LB 数据占用；仅 root 和管理员可访问。",
+    "pageAdminAudit": "查看 root 与管理员执行的管理操作记录。",
+    "pageProviderAudit": "按上游提供商、模型和小时查看最近 7 天请求成功与失败情况。",
+    "pageRequestDetail": "查看调用上下文、用量与费用快照，以及同一 Thread ID 的相邻请求。",
+    "pageUsers": "由 root 管理本地角色与全局 Provider 权限；用户身份仍由 Auth Mini 提供。",
+    "pageSettings": "确认身份边界、上游与部署限制。",
+    "accountOverview": "本账户运行概要",
+    "accountOverviewDescription": "当前账户的运行状态、语音调用与费用。",
+    "activeConsumers": "有效消费者",
+    "activeProviders": "可用上游提供商",
+    "calls24h": "24 小时调用",
+    "errors24h": "24 小时错误",
+    "audioSeconds24h": "24 小时音频时长",
+    "characters24h": "24 小时合成字符",
+    "cost24h": "24 小时费用 (USD)",
+    "consumedUsd": "累计消费 (USD)",
+    "dashboardModelsDescription": "当前可用于转写与语音合成的模型。",
+    "pricingModels": "可用模型",
+    "audioSeconds": "音频时长",
+    "characters": "字符数",
+    "cost": "费用 (USD)",
+    "usageCost": "用量与费用",
+    "consumedUsdBefore": "累计消费前 (USD)",
+    "consumedUsdAfter": "累计消费后 (USD)",
+    "providedUsdBefore": "累计提供价值前 (USD)",
+    "providedUsdAfter": "累计提供价值后 (USD)",
+    "usageTitle": "用量透视",
+    "usageDescription": "按用户、脱敏 API Token、模型和日期交叉汇总请求、音频时长、字符数与费用。",
+    "noUsage": "暂无用量",
+    "noUsageDescription": "在所选时间段发起调用后，这里会按维度汇总。",
+    "requests": "请求",
+    "requestCount": "请求次数",
+    "usageRows": "条聚合记录",
+    "rows": "行",
+    "columns": "列",
+    "data": "数据",
+    "hidden": "隐藏",
+    "last24Hours": "最近 24 小时",
+    "last7Days": "最近 7 天",
+    "allUsers": "全部用户",
+    "allConsumers": "全部消费者",
+    "allModels": "全部模型",
+    "userLabel": "用户",
+    "model": "模型",
+    "consumerLabel": "消费者",
+    "date": "日期",
+    "sortColumn": "排序",
+    "total": "总计",
+    "clearFilters": "清除筛选",
+    "pivotFields": "透视字段",
+    "dataOrder": "数据列顺序",
+    "auditTitle": "推理审计",
+    "auditDescription": "请求/响应诊断预览保存在 SQLite；不记录 Authorization 或上游 API Key。",
+    "noAudit": "暂无推理审计记录",
+    "noAuditDescription": "每次调用结束后都会写入基础审计记录。",
+    "time": "时间",
+    "requestId": "请求 ID",
+    "threadId": "Thread ID",
+    "copyThreadId": "复制 Thread ID",
+    "provider": "上游提供商",
+    "firstByteLatency": "首字节",
+    "totalLatency": "总耗时",
+    "requestSize": "请求大小",
+    "responseSize": "响应大小",
+    "requestTransportSize": "请求传输量（压缩后）",
+    "responseTransportSize": "响应传输量（压缩后）",
+    "compressionRatio": "压缩率",
+    "downstreamAcceptEncoding": "下游接受压缩",
+    "downstreamContentEncoding": "下游响应压缩",
+    "upstreamAcceptEncoding": "上游请求压缩",
+    "upstreamContentEncoding": "上游响应压缩",
+    "networkTransport": "网络传输量（压缩后）",
+    "details": "详情",
+    "filter": "筛选",
+    "filterUserId": "用户 ID",
+    "filterConsumer": "消费者",
+    "filterProvider": "提供商",
+    "filterModel": "模型",
+    "errorCode": "错误码",
+    "errorMessage": "错误信息",
+    "allStatuses": "全部状态",
+    "successfulCalls": "成功",
+    "failedCalls": "失败",
+    "auditResults": "条调用",
+    "page": "第",
+    "previousPage": "上一页",
+    "nextPage": "下一页",
+    "requestSummary": "请求概要",
+    "backToAudit": "返回推理审计",
+    "requestHeaders": "请求头",
+    "requestBody": "请求正文",
+    "responseHeaders": "响应头",
+    "headerSnapshotMissing": "未采集",
+    "headerComparisonUnavailable": "缺少一侧的头信息，无法比较差异。",
+    "responseBody": "响应正文",
+    "upstreamHttpProtocol": "上游 HTTP 协议",
+    "httpStatusCode": "HTTP 状态码",
+    "finalResponse": "转写文本",
+    "finalResponseUnavailable": "响应正文中没有可显示的文本。",
+    "diagnosticData": "请求与响应正文",
+    "diagnosticDataDescription": "仅在该 Consumer 开启诊断入库时保存；敏感凭据不会记录。",
+    "deleteAuditBodies": "删除请求/响应正文",
+    "deleteAuditBodiesTitle": "删除请求和响应正文？",
+    "deleteAuditBodiesDescription": "此操作不可撤销。调用状态、用量和请求/响应头诊断将保留。",
+    "confirmDeleteAuditBodies": "删除正文",
+    "auditBodiesDeleted": "请求/响应正文已删除",
+    "auditBodiesDeletedDescription": "此审计记录的请求与响应正文已永久删除；调用状态、用量和请求/响应头诊断仍会保留。",
+    "headerName": "头字段",
+    "downstreamToLb": "下游 → LB",
+    "lbToUpstream": "LB → 上游",
+    "upstreamToLb": "上游 → LB",
+    "lbToDownstream": "LB → 下游",
+    "different": "不同",
+    "previewTruncated": "预览已截断",
+    "affinitySource": "亲和来源",
+    "affinityRequestId": "亲和请求 ID",
+    "affinityHash": "亲和哈希",
+    "previousRequest": "上一个请求",
+    "nextRequest": "下一个请求",
+    "providerPool": "上游提供商池",
+    "providerDescription": "每个上游提供商就是一个 Qwen API Key。私有提供商只有你自己的 Consumer 可以使用，公开提供商对所有 Consumer 开放。",
+    "providerApiKey": "Qwen API Key",
+    "providerApiKeyHelp": "Qwen 平台签发的 API Key，保存在本机 SQLite 中，只有 root 与管理员可以再次读取。",
+    "providerApiKeyInvalid": "API Key 需要以 sk- 开头且不含空白字符。",
+    "providerKeyTitle": "上游提供商 API Key",
+    "providerKeyDescription": "读取或替换该提供商的 Qwen API Key。更换后调度池会立即使用新 Key。",
+    "providerKeySaved": "上游提供商 API Key 已保存",
+    "saveProviderKey": "保存 API Key",
+    "providerEnable": "启用",
+    "providerDisable": "停用",
+    "providerLastError": "最近错误",
+    "providerCooldownUntil": "冷却至",
+    "providerUsage7d": "近 7 天用量",
+    "providerUsageRequests": "请求",
+    "providerUsageErrors": "失败",
+    "providerUsageCost": "费用",
+    "providerNoUsage": "近 7 天没有请求",
+    "providerTestTitle": "上游连通性测试",
+    "providerTestDescription": "服务端使用该提供商的 API Key 读取 Qwen 可用模型目录，Key 不会返回浏览器。",
+    "providerTestResult": "结果",
+    "providerTestSucceeded": "连通正常",
+    "providerTestFailed": "上游返回错误",
+    "providerTestLatency": "耗时",
+    "providerTestHttpStatus": "HTTP 状态",
+    "providerTestModelCount": "模型数量",
+    "providerTestTranscriptionModel": "含默认转写模型",
+    "providerTestSpeechModel": "含默认语音模型",
+    "yes": "是",
+    "no": "否",
+    "addProvider": "添加上游提供商",
+    "noProviders": "尚无上游提供商",
+    "noProvidersDescription": "点击“添加上游提供商”，填入 Qwen 平台签发的 API Key，即可加入调度池。",
+    "name": "名称",
+    "owner": "所有者",
+    "status": "状态",
+    "actions": "操作",
+    "refresh": "刷新",
+    "providerUpdated": "上游提供商已更新",
+    "providerAdded": "上游提供商已添加",
+    "addProviderTitle": "添加上游提供商",
+    "nameOptional": "名称（可选）",
+    "providerNameHelp": "留空时使用提供商 UUID。",
+    "providerVisibility": "可见性",
+    "providerVisibilityPrivate": "私有",
+    "providerVisibilityPublic": "公开",
+    "providerVisibilityHelp": "私有：只有本用户名下的 Consumer 可以使用该上游提供商。公开：所有 Consumer 都可以使用。",
+    "makeProviderPublic": "改为公开",
+    "makeProviderPrivate": "改为私有",
+    "editProviderName": "编辑提供商名称",
+    "saveProviderName": "保存提供商名称",
+    "cancelProviderName": "取消编辑提供商名称",
+    "deleteProvider": "删除",
+    "deleteProviderTitle": "删除上游提供商？",
+    "deleteProviderDescription": "此操作会将上游提供商从管理列表和调度池中隐藏。其 API Key、亲和性及历史记录都会保留。",
+    "confirmDeleteProvider": "隐藏上游提供商",
+    "providerDeleted": "上游提供商已隐藏",
+    "testProvider": "测试",
+    "testingProvider": "正在测试上游连通性…",
+    "providerLoad": "处理中 / 上限",
+    "providerQueued": "排队中",
+    "consumersTitle": "租户消费者",
+    "consumersDescription": "每个 AI App 建议使用一个独立消费者；这样用量、错误和密钥轮换都能按 App 隔离。消费者凭据只在创建或轮换后显示一次。",
+    "create": "创建",
+    "noConsumers": "尚无消费者",
+    "noConsumersDescription": "为每个 AI App 创建一个独立消费者，再开始调用代理。",
+    "prefix": "前缀",
+    "apiKey": "API KEY",
+    "createdAt": "创建时间",
+    "lastUsed": "最近使用",
+    "requestArchive": "诊断入库",
+    "requestArchiveHelp": "打开后，该 Consumer 的请求/响应诊断预览才会保存到 SQLite。",
+    "requestArchiveUpdated": "诊断入库开关已更新",
+    "consumerEnabled": "消费者已启用",
+    "consumerDisabledUpdated": "消费者状态已更新",
+    "rotateConsumer": "轮换并复制",
+    "rotateConsumerTitle": "轮换 API KEY？",
+    "rotateConsumerDescription": "轮换后当前 API KEY 会立即失效，并将新的 API KEY 复制到剪贴板。确定继续吗？",
+    "confirmRotateConsumer": "确认轮换",
+    "consumerRotated": "新的 API 密钥已复制到剪贴板",
+    "consumerRotateCopyFailed": "API 密钥已轮换，但无法复制到剪贴板。请再次轮换后重试。",
+    "editConsumer": "编辑",
+    "editConsumerAriaLabel": "编辑消费者",
+    "saveConsumer": "保存",
+    "consumerUpdated": "消费者已更新",
+    "deleteConsumer": "删除",
+    "deleteConsumerTitle": "删除消费者？",
+    "deleteConsumerDescription": "此操作会从列表和鉴权中隐藏该消费者。所有调用记录和已保存的诊断内容都会保留。",
+    "confirmDeleteConsumer": "删除消费者",
+    "consumerDeleted": "消费者已删除，历史已保留",
+    "cancel": "取消",
+    "consumerAppHelp": "请为每个 AI App 单独创建一个消费者，并用 App 名称命名，便于隔离用量、排障和密钥轮换。",
+    "saveConsumerTitle": "立即保存消费者",
+    "saveConsumerDescription": "关闭后无法再次查看。不要将它写入浏览器代码、日志或聊天记录。",
+    "savedConsumer": "我已安全保存",
+    "copied": "已复制",
+    "consumer": "消费者",
+    "identityPermissions": "身份与权限",
+    "identityDescription": "浏览器会话由 Auth Mini 管理；后端只验证 access JWT。",
+    "proxyBoundary": "代理边界",
+    "proxyDescription": "仅代理 Qwen 语音能力，不提供其他厂商兼容协议。",
+    "unableLoad": "无法加载",
+    "unknownError": "未知错误",
+    "close": "关闭",
+    "inflight": "处理中",
+    "userId": "用户 ID",
+    "role": "角色",
+    "authIssuer": "认证签发方",
+    "upstream": "上游",
+    "bodyLimit": "请求体限制",
+    "affinityTtl": "亲和 TTL",
+    "upstreamHint": "Qwen API 基址，默认 https://maas.qianwenaiapi.com。",
+    "archiveRetention": "请求与响应诊断记录保留天数",
+    "statusActive": "可用",
+    "statusCooldown": "冷却中",
+    "statusAuthError": "认证错误",
+    "statusDisabled": "已禁用",
+    "statusUnknown": "未知",
+    "roleRoot": "超级管理员",
+    "roleAdmin": "管理员",
+    "roleUser": "租户用户",
+    "adminAuditTitle": "管理操作审计",
+    "adminAuditDescription": "记录 root 与管理员执行的提供商、密钥、系统与审计管理操作。",
+    "providerAuditTitle": "提供商审计",
+    "providerAuditDescription": "按上游提供商、模型和小时汇总请求结果，帮助定位失败集中在哪个上游或模型。",
+    "providerAuditChartDescription": "当前筛选范围内按小时观察失败率、请求数与音频时长。",
+    "providerAuditFailureRateChart": "时间—失败率",
+    "providerAuditRequestCountChart": "时间—请求数",
+    "providerAuditAudioSecondsChart": "时间—音频时长",
+    "providerAuditPeriod": "数据范围",
+    "providerAuditTableDescription": "每行代表一个小时、一个上游提供商和一个模型。",
+    "providerAuditNoData": "所选时间范围暂无请求",
+    "providerAuditNoDataDescription": "产生请求后，这里会按小时显示各个上游和模型的结果。",
+    "providerAuditAllProviders": "全部提供商",
+    "providerAuditUnknownProvider": "未识别提供商",
+    "providerAuditHour": "小时",
+    "providerAuditSuccessRate": "成功率",
+    "providerAuditFailureRate": "失败率",
+    "providerAuditSuccessfulRequests": "成功请求",
+    "providerAuditFailedRequests": "失败请求",
+    "providerAuditTotalRequests": "请求总数",
+    "providerAuditAudioSeconds": "音频时长",
+    "administrator": "操作用户",
+    "action": "操作",
+    "target": "目标",
+    "clientIp": "客户端 IP",
+    "setupTitle": "初始化 Qwen-LB",
+    "setupDescription": "连接品牌 Auth Mini，并将首个已验证用户绑定为唯一 root。",
+    "setupIssuer": "Auth Mini issuer",
+    "setupIssuerHelp": "填写品牌提供的 Auth Mini HTTPS 地址。Qwen-LB 只连接该实例，不会部署或管理它。",
+    "setupAudience": "JWT audience",
+    "setupAudienceHelp": "本应用自身的 audience（通常为站点域名）；登录会同时申请 linkit.ntnl.io，供控制台的 Linkit 集成使用。",
+    "connectAuth": "连接 Auth Mini",
+    "setupLogin": "验证 root 身份",
+    "setupLoginHelp": "登录成功后，当前 Auth Mini user_id 将成为 Qwen-LB root。",
+    "finishSetup": "绑定 root 并完成初始化",
+    "finishingSetup": "正在完成初始化",
+    "setupStepConnect": "连接认证实例",
+    "setupAuthenticated": "身份已验证",
+    "setupSecurity": "Setup 完成后初始化入口会立即关闭；后续登录用户默认为 user。",
+    "usersTitle": "用户与请求权限",
+    "usersDescription": "所有用户默认可以使用全局 Provider，但仅能查看和管理自己拥有的 Provider；管理员和 root 可以查看全部。列表显示每位用户的累计充值、累计消费、累计提供价值与可用额度。允许欠费的用户可在余额用尽后继续发送请求。",
+    "noUsers": "暂无用户",
+    "noUsersDescription": "用户首次通过 Auth Mini 登录后会自动出现在这里。",
+    "roleUpdated": "用户角色已更新",
+    "allowDebt": "允许欠费",
+    "allowDebtUpdated": "允许欠费设置已更新",
+    "runtimeSettings": "运行配置",
+    "runtimeSettingsDescription": "这些值保存在 SQLite app_meta 中；地址与模型立即生效，请求体上限重启后生效。",
+    "allowAllUsersDebt": "允许所有人欠费",
+    "allowAllUsersDebtHint": "打开后，所有用户均可在可用额度不足时继续发送请求。",
+    "saveSettings": "保存配置",
+    "settingsSaved": "配置已保存",
+    "responseLimit": "请求体与响应预览上限 (bytes)",
+    "providerConcurrency": "上游并发控制",
+    "providerConcurrencyDescription": "统一设置每个上游提供商的并发上限，默认为 3。",
+    "providerConcurrencyLimit": "每个提供商的并发上限",
+    "providerConcurrencyHelp": "从路由到提供商起计数，直到响应结束或请求取消，流式响应包含在内。超出上限的请求按先后顺序排队。保存后立即生效；降低上限不会中断正在处理的请求。",
+    "providerConcurrencyInvalid": "请输入大于 0 的整数。",
+    "transcriptionModels": "转写模型",
+    "transcriptionModelsDescription": "下游可调用的转写模型与单价（USD / 秒）。",
+    "transcriptionModelsUnit": "USD / 秒",
+    "speechModels": "语音合成模型",
+    "speechModelsDescription": "下游可调用的合成模型与单价（USD / 字符）。",
+    "speechModelsUnit": "USD / 字符",
+    "voiceModelRate": "单价",
+    "voiceModelAdd": "添加模型",
+    "voiceModelRemove": "移除模型",
+    "voiceModelDefault": "默认模型",
+    "voiceModelDefaultHelp": "默认模型必须命名列表中的一个模型。",
+    "voiceModelInvalid": "模型 ID、单价或默认模型无效，请检查后保存。",
+    "topupsTitle": "充值与额度",
+    "topupsDescription": "可用额度 = Midas 公共账户累计转入 + 累计提供价值 - 累计消费。",
+    "creditedUsd": "累计充值 (USD)",
+    "usageUsd": "累计消费 (USD)",
+    "availableCredit": "可用额度 (USD)",
+    "cumulativeTopups": "累计充值 (USD)",
+    "cumulativeConsumption": "累计消费 (USD)",
+    "requestNotEnforced": "当前不因可用额度不足拦截请求。",
+    "requestEnforced": "可用额度不足时会拦截请求。",
+    "midasFundTitle": "转入 Qwen-LB 公共账户",
+    "midasFundDescription": "输入金额后，Midas 会在新窗口中显示不可编辑的收款账户和金额；登录并确认后，即可完成充值。",
+    "topupAmount": "充值金额 (USD)",
+    "topupAmountHint": "最多 9 位小数。Midas 将按精确 USD 纳美元金额转账。",
+    "continueToMidas": "继续前往 Midas",
+    "publicWalletUserId": "Qwen-LB 公共账户用户 ID",
+    "copyMidasUserId": "复制用户 ID",
+    "midasTransferRefresh": "完成转账后刷新本页，累计充值会从 Midas 当前累计转入中显示。",
+    "midasUnavailable": "Midas 尚未配置",
+    "midasUnavailableDescription": "请由 root 在设置中填写 Midas 公共账户用户 ID 与 fund API key。",
+    "midasSettings": "Midas",
+    "midasSettingsDescription": "Midas 是充值唯一账本。公共账户 user ID 可安全展示给付款用户；fund API key 仅保存在服务器 SQLite 中，留空会保留现有密钥。",
+    "midasApiBase": "API 地址",
+    "midasFundUserId": "公共账户 User ID",
+    "midasFundApiKey": "Fund API key",
+    "midasConfigured": "已配置",
+    "midasNotConfigured": "未配置",
+    "midasSettingsSaved": "Midas 设置已保存",
+    "systemResources": "系统资源",
+    "systemResourcesDescription": "宿主机当前负载与 Qwen-LB 数据占用，仅 root 和管理员可见。",
+    "refreshEvery5s": "每 5 秒刷新",
+    "sampledAt": "采样于",
+    "resourceUnavailable": "无法读取系统资源",
+    "resourceUnavailableDescription": "自动刷新会继续重试，无需重新加载页面。",
+    "cpu": "CPU",
+    "memory": "内存",
+    "network": "网络",
+    "disk": "磁盘",
+    "sqlite": "SQLite 数据库",
+    "load1m": "1 分钟负载",
+    "logicalCpus": "逻辑核心",
+    "available": "可用",
+    "lbRss": "Qwen-LB RSS",
+    "otherSystemMemory": "其他系统占用",
+    "systemAvailableMemory": "系统可用内存",
+    "swap": "Swap",
+    "received": "接收",
+    "transmitted": "发送",
+    "totalReceived": "累计接收",
+    "totalTransmitted": "累计发送",
+    "networkInterfaces": "网络接口",
+    "mountPoint": "挂载点",
+    "mainFile": "主文件",
+    "walFile": "WAL",
+    "shmFile": "SHM",
+    "reclaimableSpace": "可回收空间（VACUUM）",
+    "vacuumDatabase": "执行 VACUUM",
+    "vacuumDatabaseTitle": "整理 SQLite 数据库？",
+    "vacuumDatabaseDescription": "此操作会重写数据库文件以回收可回收空间。执行期间数据库写入可能短暂等待。",
+    "vacuumDatabaseComplete": "SQLite 数据库已整理，资源指标已刷新。",
+    "voiceTitle": "语音工坊",
+    "voiceTranscribe": "语音转写",
+    "voiceSynthesize": "语音合成",
+    "voiceTranscribeTitle": "语音转写",
+    "voiceTranscribeDescription": "上传音频，经 Qwen-ASR 转写为文本；结果与费用可在推理审计中回看。",
+    "voiceAudioFile": "音频文件",
+    "voiceChooseFile": "选择文件",
+    "voiceNoFile": "尚未选择文件",
+    "voiceAudioFileHelp": "支持常见音频格式（wav、mp3、m4a、ogg、webm、flac 等），单个文件上限 24 MiB。",
+    "voiceTranscribeModelHelp": "选择转写模型；缺省使用设置中的默认模型。",
+    "voiceLanguage": "语言提示",
+    "voiceLanguagePlaceholder": "zh / en / 留空自动识别",
+    "voiceLanguageHelp": "可选；留空或填 auto 时由 Qwen 自动识别。",
+    "voiceLanguageInvalid": "请输入简短的语言标签，例如 zh 或 en。",
+    "voiceTranscribing": "正在转写…",
+    "voiceTranscribeRun": "开始转写",
+    "voiceFailed": "调用失败",
+    "voiceTranscriptionResult": "转写结果",
+    "voiceTranscriptionEmpty": "转写结果显示在这里。",
+    "voiceAuditHint": "本次调用已写入推理审计，可按模型筛选查看。",
+    "voiceOpenAudit": "在推理审计中查看",
+    "voiceSpeechTitle": "语音合成",
+    "voiceSpeechDescription": "输入文本，由 Qwen3-TTS 合成为语音；返回 WAV 音频。",
+    "voiceInput": "文本",
+    "voiceInputPlaceholder": "例如：你好，欢迎使用 Qwen-LB。",
+    "voiceInputHelp": "合成为一次请求；费用按输出字符数计。",
+    "voiceCharacters": "字符",
+    "voiceSpeechModelHelp": "选择语音合成模型；缺省使用设置中的默认模型。",
+    "voiceVoice": "音色",
+    "voiceVoiceHelp": "缺省音色为 Cherry；也可填写其他 Qwen 音色名称。",
+    "voiceSynthesizing": "正在合成…",
+    "voiceSynthesizeRun": "开始合成",
+    "voiceSpeechResult": "合成结果",
+    "voiceSpeechEmpty": "合成后的音频会显示在这里。",
+    "voiceDownload": "下载 WAV",
+    "voiceWavNote": "响应格式固定为 WAV。",
+    "voicePricesTitle": "语音计价",
+    "voicePricesDescription": "当前生效的语音单价快照：转写按音频秒数计费，语音合成按输出字符数计费。",
+    "voicePricingSource": "打开 Qwen 模型文档",
+    "voicePricingSourceUrl": "https://www.qianwenai.com/models/qwen-audio-3.0-asr-flash",
+    "voiceSecondUnit": "秒",
+    "voiceCharacterUnit": "字符",
+    "voicePricesBilling": "费用 = 单价 × 用量；单价从 Qwen 官方人民币价目按 7.2 汇率换算为美元纳元，由管理员在设置中维护。",
+    "voicePricesEditable": "价格与默认模型可在设置中调整。",
+    "pricingUnit": "计价单位",
+    "providedValue": "累计提供价值 (USD)",
   },
   en: {
-    dashboard: "Overview",
-    providers: "Providers",
-    consumers: "Consumers",
-    "codex-integration": "Codex",
-    "dsh-integration": "DSH (DeepSeek Harness)",
-    "opencode-integration": "OpenCode",
+    "dashboard": "Overview",
+    "providers": "Providers",
+    "consumers": "Consumers",
     "direct-api-integration": "Direct API",
-    "web-search": "Web Search",
-    usage: "Usage",
-    audit: "Inference audit",
-    topups: "Top up",
-    "model-prices": "Model prices",
+    "voice": "Voice studio",
+    "usage": "Usage",
+    "audit": "Inference audit",
+    "topups": "Top up",
+    "voice-prices": "Voice pricing",
     "system-resources": "System resources",
     "admin-audit": "Admin audit",
     "provider-audit": "Provider audit",
-    users: "Users",
-    settings: "Settings",
-    title: "DeepSeek-LB",
-    subtitle: "DeepSeek API reverse proxy and load balancer",
-    navigationWorkspace: "Workspace",
-    navigationIntegrations: "Downstream integrations",
-    navigationTools: "Tools",
-    navigationData: "Data",
-    navigationAdministration: "Administration",
-    english: "简体中文",
-    roleLoading: "Loading",
-    continueAuthMini: "Continue to Auth Mini",
-    loading: "Loading DeepSeek-LB…",
-    pageDashboard: "Review the current account's 24-hour operating summary.",
-    pageProviders:
-      "Manage the DeepSeek Providers you own, their runtime state, and 7-day usage.",
-    pageConsumers:
-      "Give each AI app its own downstream Consumer so usage, errors, and revocation stay isolated.",
-    pageCodexIntegration:
-      "Configure the local Codex file manually or via the browser, with a dedicated downstream Consumer.",
-    pageDshIntegration:
-      "Configure local DSH manually or authorize the browser to configure it with a dedicated downstream Consumer.",
-    pageOpenCodeIntegration:
-      "Configure the local OpenCode file manually or in the browser with a dedicated downstream Consumer.",
-    pageDirectApiIntegration:
-      "Call the DeepSeek API through DeepSeek-LB with a dedicated downstream Consumer.",
-    pageWebSearch:
-      "Run one DeepSeek-native web search and review what the call used; downstream AI apps call the same capability through /v1/web-search with a Consumer.",
-    pageUsage:
-      "Attribute requests, tokens, official cost, and actual cost to each Consumer.",
-    pageAudit:
-      "Trace each inference request, provider, pricing snapshot, and cumulative consumption; diagnostics follow the configured retention.",
-    pageTopups:
-      "Manage Midas funding, agreement authorization, and available credit.",
-    pageModelPrices:
-      "Review the official DeepSeek token-pricing snapshot, shown per 1M tokens.",
-    pageSystemResources:
-      "Review current host load and DeepSeek-LB data usage. Available only to root and administrators.",
-    pageAdminAudit:
-      "Review management operations performed by root and administrators.",
-    pageProviderAudit:
-      "Review successful and failed requests by upstream provider, model, and hour over the last 7 days.",
-    pageRequestDetail:
-      "Review call context, message structure, and adjacent requests with the same Thread ID.",
-    pageUsers:
-      "Root manages local roles and global Provider access while Auth Mini remains the identity provider.",
-    pageSettings:
-      "Confirm identity boundaries, upstream, and deployment limits.",
-    webSearchQuery: "Search query",
-    webSearchQueryPlaceholder: "Latest DeepSeek release",
-    webSearchModel: "Search model",
-    webSearchMaxResults: "Source bound",
-    webSearchMaxResultsHelp:
-      "An integer from 1 to 50. DeepSeek exposes no result-count argument, so over-returned sources are deduplicated by URL and truncated on the way back.",
-    webSearchMaxResultsInvalid: "Enter an integer from 1 to 50.",
-    webSearchMaxUses: "Search uses",
-    webSearchMaxUsesHelp:
-      "An integer from 1 to 5: how many server-side searches this turn may run. More searches cost more reasoning tokens.",
-    webSearchMaxUsesInvalid: "Enter an integer from 1 to 5.",
-    webSearchAllowedDomains: "Only these domains",
-    webSearchBlockedDomains: "Exclude these domains",
-    webSearchDomainsPlaceholder: "example.com, deepseek.com",
-    webSearchDomainsHelp:
-      "Bare domain names separated by commas or whitespace; subdomains are included. Only one of the two filters may be used.",
-    webSearchDomainsConflict: "Only-domains and excluded-domains cannot be combined.",
-    webSearchLocation: "Approximate user location",
-    webSearchLocationHelp:
-      "Optional location that helps the search return locally relevant results; empty fields are not sent.",
-    webSearchLocationCountry: "Country",
-    webSearchLocationRegion: "Region",
-    webSearchLocationCity: "City",
-    webSearchLocationTimezone: "Timezone",
-    webSearchRun: "Search",
-    webSearching: "Searching",
-    webSearchResultsTitle: "Search results",
-    webSearchResultsDescription:
-      "Results deduplicated by URL, with title, recency, and citation excerpts.",
-    webSearchEmpty: "Run a search and its queries and sources appear here.",
-    webSearchFailed: "Web search failed",
-    webSearchQueries: "Searched queries",
-    webSearchSources: "Sources",
-    webSearchTruncated: "Truncated to the bound",
-    webSearchUsage: "This call",
-    webSearchInputTokens: "Input tokens",
-    webSearchOutputTokens: "Output tokens",
-    webSearchCachedTokens: "Cached tokens",
-    webSearchCostNote:
-      "A search is billed as one model turn; cost and usage land in the inference audit, filterable by the search model.",
-    webSearchAuditLink: "Review this model's calls in the inference audit",
-    webSearchSettingsTitle: "Web search",
-    webSearchSettingsDescription:
-      "The host model runs each search turn, so the model choice sets what a search costs.",
-    webSearchModelLabel: "Search model",
-    webSearchModelHelp:
-      "A model name from DeepSeek's Anthropic-compatible API, such as deepseek-flash; search requests go to /anthropic/v1/messages under the upstream base.",
-    webSearchModelInvalid: "The search model must be 1-200 characters.",
-    webSearchEndpoint: "Search endpoint",
-    accountOverview: "Account operating summary",
-    accountOverviewDescription:
-      "Current account status, calls, and Token usage.",
-    tokenUsage24h: "Token usage in 24h",
-    tokenUsage24hDescription:
-      "Input, output, and cached Token totals from audited requests; cache rate = cached input / input, input/output ratio = input / output.",
-    cacheRate: "Cache rate",
-    inputOutputRatio: "Input/output ratio",
-    activeConsumers: "Active Consumers",
-    calls24h: "Calls in 24h",
-    errors24h: "Errors in 24h",
-    officialCost24h: "Official cost in 24h (USD)",
-    actualCost24h: "Actual cost in 24h (USD)",
-    officialConsumedUsd: "Official cumulative cost (USD)",
-    actualConsumedUsd: "Actual cumulative consumption (USD)",
-    providedValue: "Cumulative provided value (USD)",
-    officialCost: "Official cost (USD)",
-    actualCost: "Actual cost (USD)",
-    priceMultiplier: "Price multiplier",
-    officialConsumedUsdBefore: "Official cumulative cost before (USD)",
-    officialConsumedUsdAfter: "Official cumulative cost after (USD)",
-    actualConsumedUsdBefore: "Actual cumulative consumption before (USD)",
-    actualConsumedUsdAfter: "Actual cumulative consumption after (USD)",
-    officialProvidedUsdBefore:
-      "Upstream official cumulative provided value before (USD)",
-    officialProvidedUsdAfter:
-      "Upstream official cumulative provided value after (USD)",
-    actualProvidedUsdBefore:
-      "Upstream actual cumulative provided value before (USD)",
-    actualProvidedUsdAfter:
-      "Upstream actual cumulative provided value after (USD)",
-    topupsTitle: "Top-ups and credit",
-    topupsDescription:
-      "Available credit = cumulative transfers into the Midas public account + cumulative provided value - cumulative consumption.",
-    creditedUsd: "Cumulative top-ups (USD)",
-    usageUsd: "Cumulative consumption (USD)",
-    availableCredit: "Available credit (USD)",
-    cumulativeTopups: "Cumulative top-ups (USD)",
-    cumulativeConsumption: "Cumulative consumption (USD)",
-    requestNotEnforced:
-      "Requests are currently not blocked for insufficient available credit.",
-    requestEnforced:
-      "Requests are blocked when available credit is insufficient.",
-    midasFundTitle: "Transfer to the DeepSeek-LB public account",
-    midasFundDescription:
-      "Enter an amount to open Midas in a new window. It shows the recipient and amount read-only; sign in and confirm to complete the top-up.",
-    topupAmount: "Top-up amount (USD)",
-    topupAmountHint:
-      "Up to 9 decimal places. Midas transfers this exact amount in USD nanodollars.",
-    continueToMidas: "Continue to Midas",
-    publicWalletUserId: "DeepSeek-LB public-account user ID",
-    copyMidasUserId: "Copy user ID",
-    midasTransferRefresh:
-      "Refresh this page after the transfer; cumulative top-ups are read from your current Midas inbound transfers.",
-    midasUnavailable: "Midas is not configured",
-    midasUnavailableDescription:
-      "Ask root to configure the Midas public-account user ID and fund API key in Settings.",
-    midasSettings: "Midas",
-    midasSettingsDescription:
-      "Midas is the only top-up ledger. The public-account user ID is safe to share with payers; the fund API key stays in server SQLite, and a blank key retains the current key.",
-    midasApiBase: "API base URL",
-    midasFundUserId: "Public-account user ID",
-    midasFundApiKey: "Fund API key",
-    midasConfigured: "Configured",
-    midasNotConfigured: "Not configured",
-    midasSettingsSaved: "Midas settings saved",
-    modelPricesTitle: "Official DeepSeek prices",
-    modelPricesDescription:
-      "The official DeepSeek price snapshot used for cost accounting, in USD per million tokens, with peak and off-peak rates side by side.",
-    pricingUnit: "Unit",
-    pricingAsOf: "Pricing snapshot date",
-    officialPricingSource: "Open official DeepSeek pricing",
-    officialModelPriceTable: "Token pricing",
-    modelPricesTableDescription:
-      "Peak and off-peak rates are shown separately. Off-peak costs 50% of peak, and Chinese public holidays are billed off-peak all day.",
-    activeProviders: "Active providers",
-    peakCalls24h: "Peak-hour requests (24h)",
-    pricingTariffTitle: "Current billing window",
-    pricingTariffDescription:
-      "DeepSeek bills two tariffs: off-peak costs 50% of peak, and Chinese public holidays are billed off-peak all day.",
-    pricingPeak: "Peak",
-    pricingTariff: "Billing window",
-    pricingOffPeak: "Off-peak",
-    pricingModels: "Available models",
-    cacheHitTokens: "Cache hit",
-    cacheMissTokens: "Cache miss",
-    systemResources: "System resources",
-    systemResourcesDescription:
-      "Current host load and DeepSeek-LB data footprint. Visible to root and administrators only.",
-    refreshEvery5s: "Refreshes every 5 seconds",
-    sampledAt: "Sampled",
-    resourceUnavailable: "System resources unavailable",
-    resourceUnavailableDescription:
-      "Automatic refresh will keep retrying; there is no need to reload the page.",
-    cpu: "CPU",
-    memory: "Memory",
-    network: "Network",
-    disk: "Disk",
-    sqlite: "SQLite database",
-    load1m: "1-minute load",
-    logicalCpus: "Logical CPUs",
-    available: "Available",
-    lbRss: "DeepSeek-LB RSS",
-    otherSystemMemory: "Other system usage",
-    systemAvailableMemory: "System available memory",
-    swap: "Swap",
-    received: "Received",
-    transmitted: "Transmitted",
-    totalReceived: "Total received",
-    totalTransmitted: "Total transmitted",
-    networkInterfaces: "Network interfaces",
-    mountPoint: "Mount point",
-    mainFile: "Main file",
-    walFile: "WAL",
-    shmFile: "SHM",
-    reclaimableSpace: "Reclaimable (VACUUM)",
-    vacuumDatabase: "Run VACUUM",
-    vacuumDatabaseTitle: "Compact the SQLite database?",
-    vacuumDatabaseDescription:
-      "This rewrites the database file to reclaim free space. Database writes may wait briefly while it runs.",
-    vacuumDatabaseComplete:
-      "SQLite database compacted and resource metrics refreshed.",
-    providerPool: "Provider pool",
-    providerDescription:
-      "Every provider is one DeepSeek API key. Private providers serve only your own Consumers; public providers serve every Consumer.",
-    providerApiKey: "DeepSeek API key",
-    providerApiKeyHelp:
-      "The API key issued by the DeepSeek platform. It is stored in the local SQLite database and can only be read again by root and administrators.",
-    providerApiKeyInvalid:
-      "The API key must start with sk- and contain no whitespace.",
-    providerKeyTitle: "Provider API key",
-    providerKeyDescription:
-      "Read or replace this provider's DeepSeek API key. The scheduler picks up the new key immediately.",
-    providerKeySaved: "Provider API key saved",
-    saveProviderKey: "Save API key",
-    providerEnable: "Enable",
-    providerDisable: "Disable",
-    providerLastError: "Last error",
-    providerCooldownUntil: "Cooling down until",
-    providerUsage7d: "Last 7 days",
-    providerUsageRequests: "Requests",
-    providerUsageErrors: "Failed",
-    providerUsageCost: "Cost",
-    providerNoUsage: "No requests in the last 7 days",
-    providerTestTitle: "Upstream connectivity test",
-    providerTestDescription:
-      "The server sends one minimal request to DeepSeek with this provider's API key. The key never reaches the browser.",
-    providerTestResult: "Result",
-    providerTestSucceeded: "Upstream reachable",
-    providerTestFailed: "Upstream returned an error",
-    providerTestModel: "Test model",
-    providerTestLatency: "Latency",
-    providerBalance: "Balance",
-    providerBalanceTitle: "Upstream balance",
-    providerBalanceDescription:
-      "Reads the DeepSeek account balance directly. A provider with no balance returns 402 and is parked.",
-    providerBalanceAvailable: "Can serve requests",
-    providerBalanceUnavailable: "DeepSeek did not return balance information.",
-    yes: "Yes",
-    no: "No",
-    addProvider: "Add provider",
-    noProviders: "No providers",
-    noProvidersDescription:
-      "Add a Provider with a DeepSeek API key to join the scheduling pool.",
-    name: "Name",
-    owner: "Owner",
-    status: "Status",
-    actions: "Actions",
-    refresh: "Refresh",
-    providerUpdated: "Provider updated",
-    providerAdded: "Provider added",
-    addProviderTitle: "Add provider",
-    nameOptional: "Name (optional)",
-    providerNameHelp: "Falls back to the Provider UUID when empty.",
-    providerVisibility: "Visibility",
-    providerVisibilityPrivate: "Private",
-    providerVisibilityPublic: "Public",
-    providerVisibilityHelp:
-      "Private: only Consumers owned by this user may route to the provider. Public: every Consumer may route to it.",
-    makeProviderPublic: "Publish to everyone",
-    makeProviderPrivate: "Restrict to my Consumers",
-    editProviderName: "Edit provider name",
-    saveProviderName: "Save provider name",
-    cancelProviderName: "Cancel provider name edit",
-    deleteProvider: "Delete",
-    deleteProviderTitle: "Delete provider?",
-    deleteProviderDescription:
-      "This hides the Provider from management and scheduling. Its API key, affinities, and history are retained.",
-    confirmDeleteProvider: "Hide provider",
-    providerDeleted: "Provider hidden",
-    testProvider: "Test",
-    testingProvider: "Testing upstream connectivity…",
-    consumersTitle: "Tenant Consumers",
-    consumersDescription:
-      "Create one downstream Consumer per AI app so usage, errors, and key rotation remain isolated. Secrets are shown after creation and rotation only.",
-    create: "Create",
-    noConsumers: "No Consumers",
-    noConsumersDescription:
-      "Create a separate Consumer for each AI app before calling the proxy.",
-    prefix: "Prefix",
-    apiKey: "API KEY",
-    createdAt: "Created",
-    lastUsed: "Last used",
-    requestArchive: "Archive diagnostics",
-    requestArchiveHelp:
-      "When enabled, this Consumer's request/response diagnostic previews are saved to SQLite.",
-    requestArchiveUpdated: "Diagnostic archive setting updated",
-    consumerEnabled: "Consumer enabled",
-    consumerDisabledUpdated: "Consumer status updated",
-    rotateConsumer: "Rotate and copy",
-    rotateConsumerTitle: "Rotate API key?",
-    rotateConsumerDescription:
-      "The current API key will stop working immediately, and the new key will be copied to your clipboard. Continue?",
-    confirmRotateConsumer: "Confirm rotation",
-    consumerRotated: "New API key copied to clipboard",
-    consumerRotateCopyFailed:
-      "The API key was rotated, but could not be copied. Rotate it again to retry.",
-    editConsumer: "Edit",
-    editConsumerAriaLabel: "Edit consumer",
-    saveConsumer: "Save",
-    consumerUpdated: "Consumer updated",
-    deleteConsumer: "Delete",
-    deleteConsumerTitle: "Delete Consumer?",
-    deleteConsumerDescription:
-      "This hides the Consumer from the list and authentication. All call history and saved diagnostics are retained.",
-    confirmDeleteConsumer: "Delete Consumer",
-    consumerDeleted: "Consumer deleted; history retained",
-    cancel: "Cancel",
-    consumerAppHelp:
-      "Create one Consumer per AI app and name it after the app so usage, troubleshooting, and key rotation stay isolated.",
-    saveConsumerTitle: "Save this Consumer now",
-    saveConsumerDescription:
-      "It cannot be viewed again after closing. Do not put it in browser code, logs, or chat.",
-    savedConsumer: "I stored it safely",
-    copied: "Copied",
-    usageTitle: "Usage pivot",
-    usageDescription:
-      "Cross-tabulate request Tokens by user, masked API token, model, and date. Adjust rows, columns, and aggregate data to isolate usage.",
-    noUsage: "No usage yet",
-    noUsageDescription:
-      "Usage appears here by dimension after API calls in the selected period.",
-    requests: "Requests",
-    errors: "Errors",
-    last24Hours: "Last 24 hours",
-    last7Days: "Last 7 days",
-    allUsers: "All users",
-    allConsumers: "All Consumers",
-    allModels: "All models",
-    userLabel: "User",
-    model: "Model",
-    consumerLabel: "Consumer",
-    date: "Date",
-    rows: "Rows",
-    columns: "Columns",
-    data: "Data",
-    hidden: "Hidden",
-    inputTokens: "Input Tokens",
-    cachedInputTokens: "Cached Input Tokens",
-    outputTokens: "Output Tokens",
-    requestCount: "Request count",
-    usageRows: "aggregated rows",
-    sortColumn: "Sort",
-    total: "Total",
-    clearFilters: "Clear filters",
-    pivotFields: "Pivot fields",
-    dataOrder: "Data column order",
-    auditTitle: "Inference audit",
-    auditDescription:
-      "Request/response diagnostic previews are stored in SQLite; Authorization headers and upstream API keys are excluded.",
-    noAudit: "No inference audit records",
-    noAuditDescription:
-      "A basic inference audit record is written when each proxy call terminates.",
-    time: "Time",
-    requestId: "Request ID",
-    threadId: "Thread ID",
-    copyThreadId: "Copy Thread ID",
-    provider: "Provider",
-    firstByteLatency: "First byte",
-    totalLatency: "Total",
-    requestSize: "Request size",
-    responseSize: "Response size",
-    requestTransportSize: "Request transport (compressed)",
-    responseTransportSize: "Response transport (compressed)",
-    compressionRatio: "Compression ratio",
-    downstreamAcceptEncoding: "Downstream accepts",
-    downstreamContentEncoding: "Downstream response encoding",
-    upstreamAcceptEncoding: "Upstream request encoding",
-    upstreamContentEncoding: "Upstream response encoding",
-    networkTransport: "Network transport (compressed)",
-    reasoningEffort: "Reasoning effort",
-    cachedInput: "Cached input",
-    details: "Details",
-    filter: "Filter",
-    filterUserId: "User ID",
-    filterConsumer: "Consumer",
-    filterProvider: "Provider",
-    filterModel: "Model",
-    errorCode: "Error code",
-    errorMessage: "Error message",
-    allStatuses: "All statuses",
-    successfulCalls: "Successful",
-    failedCalls: "Failed",
-    auditResults: "calls",
-    page: "Page",
-    previousPage: "Previous",
-    nextPage: "Next",
-    requestDetail: "Request details",
-    requestSummary: "Request summary",
-    backToAudit: "Back to inference audit",
-    requestHeaders: "Request headers",
-    requestBody: "Request body",
-    responseHeaders: "Response headers",
-    headerSnapshotMissing: "Not captured",
-    headerComparisonUnavailable:
-      "One header snapshot was not captured; differences cannot be determined.",
-    responseBody: "Response body",
-    tokenUsage: "Token usage",
-    cacheHitRate: "Cache hit rate",
-    upstreamHttpProtocol: "Upstream HTTP protocol",
-    httpStatusCode: "HTTP status code",
-    finalResponse: "Final response",
-    finalResponseUnavailable:
-      "No response.output was found in the response body.",
-    diagnosticData: "Request and response bodies",
-    diagnosticDataDescription:
-      "Saved only when diagnostics are enabled for this Consumer; sensitive credentials are excluded.",
-    deleteAuditBodies: "Delete request and response bodies",
-    deleteAuditBodiesTitle: "Delete request and response bodies?",
-    deleteAuditBodiesDescription:
-      "This cannot be undone. Call status, usage, and request/response header diagnostics will remain.",
-    confirmDeleteAuditBodies: "Delete bodies",
-    auditBodiesDeleted: "Request and response bodies deleted",
-    auditBodiesDeletedDescription:
-      "The request and response bodies for this audit record were permanently deleted. Call status, usage, and request/response header diagnostics remain available.",
-    headerName: "Header",
-    downstreamToLb: "Downstream → LB",
-    lbToUpstream: "LB → Upstream",
-    upstreamToLb: "Upstream → LB",
-    lbToDownstream: "LB → Downstream",
-    different: "Different",
-    previewTruncated: "Preview truncated",
-    affinitySource: "Affinity source",
-    affinityRequestId: "Affinity request ID",
-    affinityHash: "Affinity hash",
-    previousRequest: "Previous request",
-    nextRequest: "Next request",
-    tools: "Tools",
-    identityPermissions: "Identity and permissions",
-    identityDescription:
-      "Auth Mini manages the browser session; the backend only verifies access JWTs.",
-    proxyBoundary: "Proxy boundary",
-    proxyDescription:
-      "Proxies DeepSeek capabilities only; no other vendor protocol compatibility.",
-    unableLoad: "Unable to load",
-    unknownError: "Unknown error",
-    close: "Close",
-    inflight: "Inflight",
-    providerLoad: "In progress / limit",
-    providerQueued: "Queued",
-    providerConcurrency: "Upstream concurrency",
-    providerConcurrencyDescription:
-      "Set one concurrency limit for every upstream provider. The default is 3.",
-    providerConcurrencyLimit: "Concurrent requests per provider",
-    providerConcurrencyHelp:
-      "A request occupies a slot from routing until the response ends or the request is cancelled, including streaming responses. Extra requests queue in arrival order. Changes apply immediately; lowering the limit lets active requests finish.",
-    providerConcurrencyInvalid: "Enter a whole number greater than 0.",
-    consumer: "Consumer",
-    input: "Input",
-    output: "Output",
-    userId: "User ID",
-    role: "Role",
-    authIssuer: "Auth issuer",
-    upstream: "Upstream",
-    bodyLimit: "Body limit",
-    affinityTtl: "Affinity TTL",
-    upstreamHint:
-      "DeepSeek API base URL; defaults to https://api.deepseek.com.",
-    archiveRetention: "Request and response diagnostic retention (days)",
-    statusActive: "Available",
-    statusCooldown: "Cooling down",
-    statusAuthError: "Authentication error",
-    statusDisabled: "Disabled",
-    statusUnknown: "Unknown",
-    roleRoot: "Root",
-    roleAdmin: "Administrator",
-    roleUser: "Tenant user",
-    adminAuditTitle: "Administrative operation audit",
-    adminAuditDescription:
-      "Provider, key, system, and audit management operations performed by root and administrators.",
-    providerAuditTitle: "Provider audit",
-    providerAuditDescription:
-      "Summarize request outcomes by upstream provider, model, and hour to locate concentrated failures.",
-    providerAuditChartDescription:
-      "Hourly failure rate, request count, and input Tokens for the current filters.",
-    providerAuditFailureRateChart: "Time — failure rate",
-    providerAuditRequestCountChart: "Time — requests",
-    providerAuditInputTokensChart: "Time — Input Tokens",
-    providerAuditPeriod: "Data range",
-    providerAuditTableDescription:
-      "Each row represents one hour, one upstream provider, and one model.",
-    providerAuditNoData: "No requests in the selected range",
-    providerAuditNoDataDescription:
-      "Hourly provider and model outcomes will appear here after requests are made.",
-    providerAuditAllProviders: "All providers",
-    providerAuditUnknownProvider: "Unidentified provider",
-    providerAuditHour: "Hour",
-    providerAuditSuccessRate: "Success rate",
-    providerAuditFailureRate: "Failure rate",
-    providerAuditSuccessfulRequests: "Successful requests",
-    providerAuditFailedRequests: "Failed requests",
-    providerAuditTotalRequests: "Total requests",
-    providerAuditInputTokens: "Input Tokens",
-    administrator: "Actor",
-    action: "Action",
-    target: "Target",
-    clientIp: "Client IP",
-    setupTitle: "Initialize DeepSeek-LB",
-    setupDescription:
-      "Connect the brand Auth Mini instance and bind the first verified user as the only root.",
-    setupIssuer: "Auth Mini issuer",
-    setupIssuerHelp:
-      "Enter the Auth Mini HTTPS URL supplied by the brand. DeepSeek-LB connects to it; it does not deploy or manage it.",
-    setupAudience: "JWT audience",
-    setupAudienceHelp:
-      "This app's own audience (usually the site hostname). The login also requests linkit.ntnl.io for the console's Linkit integration.",
-    connectAuth: "Connect Auth Mini",
-    setupLogin: "Verify the root identity",
-    setupLoginHelp:
-      "After sign-in, this Auth Mini user_id becomes the DeepSeek-LB root.",
-    finishSetup: "Bind root and finish setup",
-    finishingSetup: "Finishing setup",
-    setupStepConnect: "Connect identity",
-    setupAuthenticated: "Identity verified",
-    setupSecurity:
-      "The setup endpoint closes immediately after completion. Later first-time users receive the user role.",
-    usersTitle: "Users and request permissions",
-    usersDescription:
-      "Every user can use global Providers by default, while users can view and manage only their own Providers. Administrators and root can view all Providers. The list shows each user's cumulative top-ups, consumption, provided value, and available credit. Allow debt lets a user continue making requests after their prepaid balance is exhausted.",
-    noUsers: "No users",
-    noUsersDescription:
-      "Users appear here after their first Auth Mini sign-in.",
-    roleUpdated: "User role updated",
-    allowDebt: "Allow debt",
-    allowDebtUpdated: "Allow-debt setting updated",
-    runtimeSettings: "Runtime settings",
-    runtimeSettingsDescription:
-      "These values live in SQLite app_meta. URLs and models apply immediately; body limits apply after restart.",
-    availableModels: "Available models",
-    availableModelsDescription:
-      "Controls downstream-callable models. This list immediately drives /v1/models, the model-prices page, and Responses validation.",
-    availableModelsHelp:
-      "Enter one Model ID per line. Empty or duplicate IDs cannot be saved.",
-    availableModelsSaved: "Available models saved",
-    availableModelsRequired: "Enter at least one Model ID",
-    modelPriceMultiplier: "Default price multiplier",
-    modelPriceMultiplierHint:
-      "Future requests charge official cost multiplied by this value; every request keeps the multiplier snapshot used for settlement.",
-    allowAllUsersDebt: "Allow debt for all users",
-    allowAllUsersDebtHint:
-      "When enabled, every user can continue making requests after available credit is exhausted.",
-    saveSettings: "Save settings",
-    settingsSaved: "Settings saved",
-    responseLimit: "Request & response body limit (bytes)",
+    "users": "Users",
+    "settings": "Settings",
+    "requestDetail": "Request details",
+    "title": "Qwen-LB",
+    "subtitle": "Qwen voice API reverse proxy and load balancer",
+    "navigationWorkspace": "Workspace",
+    "navigationIntegrations": "Downstream integrations",
+    "navigationTools": "Tools",
+    "navigationData": "Data",
+    "navigationAdministration": "Administration",
+    "english": "简体中文",
+    "roleLoading": "Loading",
+    "continueAuthMini": "Continue to Auth Mini",
+    "loading": "Loading Qwen-LB…",
+    "pageDashboard": "Review the current account's 24-hour operating summary.",
+    "pageProviders": "Manage the Qwen Providers you own, their runtime state, and 7-day usage.",
+    "pageConsumers": "Give each AI app its own downstream Consumer so usage, errors, and revocation stay isolated.",
+    "pageDirectApiIntegration": "Call the Qwen voice APIs directly with a dedicated downstream Consumer.",
+    "pageVoice": "Try one transcription or synthesis call from the console without preparing a Consumer credential yourself.",
+    "pageUsage": "Attribute requests, audio seconds, characters, and cost to each Consumer.",
+    "pageAudit": "Trace each voice call, provider, cost snapshot, and cumulative consumption; diagnostics follow the configured retention.",
+    "pageTopups": "Manage Midas funding, agreement authorization, and available credit.",
+    "pageVoicePrices": "Review the active voice rates; adjust rates and defaults in Settings.",
+    "pageSystemResources": "Review current host load and Qwen-LB data usage. Available only to root and administrators.",
+    "pageAdminAudit": "Review management operations performed by root and administrators.",
+    "pageProviderAudit": "Review successful and failed requests by upstream provider, model, and hour over the last 7 days.",
+    "pageRequestDetail": "Review call context, usage and cost snapshots, and adjacent requests with the same Thread ID.",
+    "pageUsers": "Root manages local roles and global Provider access while Auth Mini remains the identity provider.",
+    "pageSettings": "Confirm identity boundaries, upstream, and deployment limits.",
+    "accountOverview": "Account operating summary",
+    "accountOverviewDescription": "Current account status, voice calls, and cost.",
+    "activeConsumers": "Active Consumers",
+    "activeProviders": "Active providers",
+    "calls24h": "Calls in 24h",
+    "errors24h": "Errors in 24h",
+    "audioSeconds24h": "Audio seconds in 24h",
+    "characters24h": "Characters in 24h",
+    "cost24h": "Cost in 24h (USD)",
+    "consumedUsd": "Cumulative consumption (USD)",
+    "dashboardModelsDescription": "The models currently serving transcription and speech.",
+    "pricingModels": "Available models",
+    "audioSeconds": "Audio seconds",
+    "characters": "Characters",
+    "cost": "Cost (USD)",
+    "usageCost": "Usage and cost",
+    "consumedUsdBefore": "Cumulative consumption before (USD)",
+    "consumedUsdAfter": "Cumulative consumption after (USD)",
+    "providedUsdBefore": "Cumulative provided value before (USD)",
+    "providedUsdAfter": "Cumulative provided value after (USD)",
+    "usageTitle": "Usage pivot",
+    "usageDescription": "Cross-tabulate requests, audio seconds, characters, and cost by user, masked API token, model, and date.",
+    "noUsage": "No usage yet",
+    "noUsageDescription": "Usage appears here by dimension after calls in the selected period.",
+    "requests": "Requests",
+    "requestCount": "Request count",
+    "usageRows": "aggregated rows",
+    "rows": "Rows",
+    "columns": "Columns",
+    "data": "Data",
+    "hidden": "Hidden",
+    "last24Hours": "Last 24 hours",
+    "last7Days": "Last 7 days",
+    "allUsers": "All users",
+    "allConsumers": "All Consumers",
+    "allModels": "All models",
+    "userLabel": "User",
+    "model": "Model",
+    "consumerLabel": "Consumer",
+    "date": "Date",
+    "sortColumn": "Sort",
+    "total": "Total",
+    "clearFilters": "Clear filters",
+    "pivotFields": "Pivot fields",
+    "dataOrder": "Data column order",
+    "auditTitle": "Inference audit",
+    "auditDescription": "Request/response diagnostic previews are stored in SQLite; Authorization headers and upstream API keys are excluded.",
+    "noAudit": "No inference audit records",
+    "noAuditDescription": "A basic audit record is written when each call terminates.",
+    "time": "Time",
+    "requestId": "Request ID",
+    "threadId": "Thread ID",
+    "copyThreadId": "Copy Thread ID",
+    "provider": "Provider",
+    "firstByteLatency": "First byte",
+    "totalLatency": "Total",
+    "requestSize": "Request size",
+    "responseSize": "Response size",
+    "requestTransportSize": "Request transport (compressed)",
+    "responseTransportSize": "Response transport (compressed)",
+    "compressionRatio": "Compression ratio",
+    "downstreamAcceptEncoding": "Downstream accepts",
+    "downstreamContentEncoding": "Downstream response encoding",
+    "upstreamAcceptEncoding": "Upstream request encoding",
+    "upstreamContentEncoding": "Upstream response encoding",
+    "networkTransport": "Network transport (compressed)",
+    "details": "Details",
+    "filter": "Filter",
+    "filterUserId": "User ID",
+    "filterConsumer": "Consumer",
+    "filterProvider": "Provider",
+    "filterModel": "Model",
+    "errorCode": "Error code",
+    "errorMessage": "Error message",
+    "allStatuses": "All statuses",
+    "successfulCalls": "Successful",
+    "failedCalls": "Failed",
+    "auditResults": "calls",
+    "page": "Page",
+    "previousPage": "Previous",
+    "nextPage": "Next",
+    "requestSummary": "Request summary",
+    "backToAudit": "Back to inference audit",
+    "requestHeaders": "Request headers",
+    "requestBody": "Request body",
+    "responseHeaders": "Response headers",
+    "headerSnapshotMissing": "Not captured",
+    "headerComparisonUnavailable": "One header snapshot was not captured; differences cannot be determined.",
+    "responseBody": "Response body",
+    "upstreamHttpProtocol": "Upstream HTTP protocol",
+    "httpStatusCode": "HTTP status code",
+    "finalResponse": "Transcription text",
+    "finalResponseUnavailable": "No displayable text was found in the response body.",
+    "diagnosticData": "Request and response bodies",
+    "diagnosticDataDescription": "Saved only when diagnostics are enabled for this Consumer; sensitive credentials are excluded.",
+    "deleteAuditBodies": "Delete request and response bodies",
+    "deleteAuditBodiesTitle": "Delete request and response bodies?",
+    "deleteAuditBodiesDescription": "This cannot be undone. Call status, usage, and request/response header diagnostics will remain.",
+    "confirmDeleteAuditBodies": "Delete bodies",
+    "auditBodiesDeleted": "Request and response bodies deleted",
+    "auditBodiesDeletedDescription": "The request and response bodies for this audit record were permanently deleted. Call status, usage, and request/response header diagnostics remain available.",
+    "headerName": "Header",
+    "downstreamToLb": "Downstream → LB",
+    "lbToUpstream": "LB → Upstream",
+    "upstreamToLb": "Upstream → LB",
+    "lbToDownstream": "LB → Downstream",
+    "different": "Different",
+    "previewTruncated": "Preview truncated",
+    "affinitySource": "Affinity source",
+    "affinityRequestId": "Affinity request ID",
+    "affinityHash": "Affinity hash",
+    "previousRequest": "Previous request",
+    "nextRequest": "Next request",
+    "providerPool": "Provider pool",
+    "providerDescription": "Every provider is one Qwen API key. Private providers serve only your own Consumers; public providers serve every Consumer.",
+    "providerApiKey": "Qwen API key",
+    "providerApiKeyHelp": "The API key issued by the Qwen platform. It is stored in the local SQLite database and can only be read again by root and administrators.",
+    "providerApiKeyInvalid": "The API key must start with sk- and contain no whitespace.",
+    "providerKeyTitle": "Provider API key",
+    "providerKeyDescription": "Read or replace this provider's Qwen API key. The scheduler picks up the new key immediately.",
+    "providerKeySaved": "Provider API key saved",
+    "saveProviderKey": "Save API key",
+    "providerEnable": "Enable",
+    "providerDisable": "Disable",
+    "providerLastError": "Last error",
+    "providerCooldownUntil": "Cooling down until",
+    "providerUsage7d": "Last 7 days",
+    "providerUsageRequests": "Requests",
+    "providerUsageErrors": "Failed",
+    "providerUsageCost": "Cost",
+    "providerNoUsage": "No requests in the last 7 days",
+    "providerTestTitle": "Upstream connectivity test",
+    "providerTestDescription": "The server reads the Qwen model catalog with this provider's API key; the key never reaches the browser.",
+    "providerTestResult": "Result",
+    "providerTestSucceeded": "Upstream reachable",
+    "providerTestFailed": "Upstream returned an error",
+    "providerTestLatency": "Latency",
+    "providerTestHttpStatus": "HTTP status",
+    "providerTestModelCount": "Models seen",
+    "providerTestTranscriptionModel": "Default transcription model",
+    "providerTestSpeechModel": "Default speech model",
+    "yes": "Yes",
+    "no": "No",
+    "addProvider": "Add provider",
+    "noProviders": "No providers",
+    "noProvidersDescription": "Add a Provider with a Qwen API key to join the scheduling pool.",
+    "name": "Name",
+    "owner": "Owner",
+    "status": "Status",
+    "actions": "Actions",
+    "refresh": "Refresh",
+    "providerUpdated": "Provider updated",
+    "providerAdded": "Provider added",
+    "addProviderTitle": "Add provider",
+    "nameOptional": "Name (optional)",
+    "providerNameHelp": "Falls back to the Provider UUID when empty.",
+    "providerVisibility": "Visibility",
+    "providerVisibilityPrivate": "Private",
+    "providerVisibilityPublic": "Public",
+    "providerVisibilityHelp": "Private: only Consumers owned by this user may route to the provider. Public: every Consumer may route to it.",
+    "makeProviderPublic": "Publish to everyone",
+    "makeProviderPrivate": "Restrict to my Consumers",
+    "editProviderName": "Edit provider name",
+    "saveProviderName": "Save provider name",
+    "cancelProviderName": "Cancel provider name edit",
+    "deleteProvider": "Delete",
+    "deleteProviderTitle": "Delete provider?",
+    "deleteProviderDescription": "This hides the Provider from management and scheduling. Its API key, affinities, and history are retained.",
+    "confirmDeleteProvider": "Hide provider",
+    "providerDeleted": "Provider hidden",
+    "testProvider": "Test",
+    "testingProvider": "Testing upstream connectivity…",
+    "providerLoad": "In progress / limit",
+    "providerQueued": "Queued",
+    "consumersTitle": "Tenant Consumers",
+    "consumersDescription": "Create one downstream Consumer per AI app so usage, errors, and key rotation remain isolated. Secrets are shown after creation and rotation only.",
+    "create": "Create",
+    "noConsumers": "No Consumers",
+    "noConsumersDescription": "Create a separate Consumer for each AI app before calling the proxy.",
+    "prefix": "Prefix",
+    "apiKey": "API KEY",
+    "createdAt": "Created",
+    "lastUsed": "Last used",
+    "requestArchive": "Archive diagnostics",
+    "requestArchiveHelp": "When enabled, this Consumer's request/response diagnostic previews are saved to SQLite.",
+    "requestArchiveUpdated": "Diagnostic archive setting updated",
+    "consumerEnabled": "Consumer enabled",
+    "consumerDisabledUpdated": "Consumer status updated",
+    "rotateConsumer": "Rotate and copy",
+    "rotateConsumerTitle": "Rotate API key?",
+    "rotateConsumerDescription": "The current API key will stop working immediately, and the new key will be copied to your clipboard. Continue?",
+    "confirmRotateConsumer": "Confirm rotation",
+    "consumerRotated": "New API key copied to clipboard",
+    "consumerRotateCopyFailed": "The API key was rotated, but could not be copied. Rotate it again to retry.",
+    "editConsumer": "Edit",
+    "editConsumerAriaLabel": "Edit consumer",
+    "saveConsumer": "Save",
+    "consumerUpdated": "Consumer updated",
+    "deleteConsumer": "Delete",
+    "deleteConsumerTitle": "Delete Consumer?",
+    "deleteConsumerDescription": "This hides the Consumer from the list and authentication. All call history and saved diagnostics are retained.",
+    "confirmDeleteConsumer": "Delete Consumer",
+    "consumerDeleted": "Consumer deleted; history retained",
+    "cancel": "Cancel",
+    "consumerAppHelp": "Create one Consumer per AI app and name it after the app so usage, troubleshooting, and key rotation stay isolated.",
+    "saveConsumerTitle": "Save this Consumer now",
+    "saveConsumerDescription": "It cannot be viewed again after closing. Do not put it in browser code, logs, or chat.",
+    "savedConsumer": "I stored it safely",
+    "copied": "Copied",
+    "consumer": "Consumer",
+    "identityPermissions": "Identity and permissions",
+    "identityDescription": "Auth Mini manages the browser session; the backend only verifies access JWTs.",
+    "proxyBoundary": "Proxy boundary",
+    "proxyDescription": "Proxies Qwen voice capabilities only; no other vendor protocol compatibility.",
+    "unableLoad": "Unable to load",
+    "unknownError": "Unknown error",
+    "close": "Close",
+    "inflight": "Inflight",
+    "userId": "User ID",
+    "role": "Role",
+    "authIssuer": "Auth issuer",
+    "upstream": "Upstream",
+    "bodyLimit": "Body limit",
+    "affinityTtl": "Affinity TTL",
+    "upstreamHint": "Qwen API base URL; defaults to https://maas.qianwenaiapi.com.",
+    "archiveRetention": "Request and response diagnostic retention (days)",
+    "statusActive": "Available",
+    "statusCooldown": "Cooling down",
+    "statusAuthError": "Authentication error",
+    "statusDisabled": "Disabled",
+    "statusUnknown": "Unknown",
+    "roleRoot": "Root",
+    "roleAdmin": "Administrator",
+    "roleUser": "Tenant user",
+    "adminAuditTitle": "Administrative operation audit",
+    "adminAuditDescription": "Provider, key, system, and audit management operations performed by root and administrators.",
+    "providerAuditTitle": "Provider audit",
+    "providerAuditDescription": "Summarize request outcomes by upstream provider, model, and hour to locate concentrated failures.",
+    "providerAuditChartDescription": "Hourly failure rate, request count, and audio seconds for the current filters.",
+    "providerAuditFailureRateChart": "Time — failure rate",
+    "providerAuditRequestCountChart": "Time — requests",
+    "providerAuditAudioSecondsChart": "Time — audio seconds",
+    "providerAuditPeriod": "Data range",
+    "providerAuditTableDescription": "Each row represents one hour, one upstream provider, and one model.",
+    "providerAuditNoData": "No requests in the selected range",
+    "providerAuditNoDataDescription": "Hourly provider and model outcomes will appear here after requests are made.",
+    "providerAuditAllProviders": "All providers",
+    "providerAuditUnknownProvider": "Unidentified provider",
+    "providerAuditHour": "Hour",
+    "providerAuditSuccessRate": "Success rate",
+    "providerAuditFailureRate": "Failure rate",
+    "providerAuditSuccessfulRequests": "Successful requests",
+    "providerAuditFailedRequests": "Failed requests",
+    "providerAuditTotalRequests": "Total requests",
+    "providerAuditAudioSeconds": "Audio seconds",
+    "administrator": "Actor",
+    "action": "Action",
+    "target": "Target",
+    "clientIp": "Client IP",
+    "setupTitle": "Initialize Qwen-LB",
+    "setupDescription": "Connect the brand Auth Mini instance and bind the first verified user as the only root.",
+    "setupIssuer": "Auth Mini issuer",
+    "setupIssuerHelp": "Enter the Auth Mini HTTPS URL supplied by the brand. Qwen-LB connects to it; it does not deploy or manage it.",
+    "setupAudience": "JWT audience",
+    "setupAudienceHelp": "This app's own audience (usually the site hostname). The login also requests linkit.ntnl.io for the console's Linkit integration.",
+    "connectAuth": "Connect Auth Mini",
+    "setupLogin": "Verify the root identity",
+    "setupLoginHelp": "After sign-in, this Auth Mini user_id becomes the Qwen-LB root.",
+    "finishSetup": "Bind root and finish setup",
+    "finishingSetup": "Finishing setup",
+    "setupStepConnect": "Connect identity",
+    "setupAuthenticated": "Identity verified",
+    "setupSecurity": "The setup endpoint closes immediately after completion. Later first-time users receive the user role.",
+    "usersTitle": "Users and request permissions",
+    "usersDescription": "Every user can use global Providers by default, while users can view and manage only their own Providers. Administrators and root can view all Providers. The list shows each user's cumulative top-ups, consumption, provided value, and available credit. Allow debt lets a user continue making requests after their prepaid balance is exhausted.",
+    "noUsers": "No users",
+    "noUsersDescription": "Users appear here after their first Auth Mini sign-in.",
+    "roleUpdated": "User role updated",
+    "allowDebt": "Allow debt",
+    "allowDebtUpdated": "Allow-debt setting updated",
+    "runtimeSettings": "Runtime settings",
+    "runtimeSettingsDescription": "These values live in SQLite app_meta. URLs and models apply immediately; body limits apply after restart.",
+    "allowAllUsersDebt": "Allow debt for all users",
+    "allowAllUsersDebtHint": "When enabled, every user can continue making requests after available credit is exhausted.",
+    "saveSettings": "Save settings",
+    "settingsSaved": "Settings saved",
+    "responseLimit": "Request & response body limit (bytes)",
+    "providerConcurrency": "Upstream concurrency",
+    "providerConcurrencyDescription": "Set one concurrency limit for every upstream provider. The default is 3.",
+    "providerConcurrencyLimit": "Concurrent requests per provider",
+    "providerConcurrencyHelp": "A request occupies a slot from routing until the response ends or the request is cancelled, including streaming responses. Extra requests queue in arrival order. Changes apply immediately; lowering the limit lets active requests finish.",
+    "providerConcurrencyInvalid": "Enter a whole number greater than 0.",
+    "transcriptionModels": "Transcription models",
+    "transcriptionModelsDescription": "Downstream-callable transcription models and their rate (USD per second).",
+    "transcriptionModelsUnit": "USD / second",
+    "speechModels": "Speech models",
+    "speechModelsDescription": "Downstream-callable speech models and their rate (USD per character).",
+    "speechModelsUnit": "USD / character",
+    "voiceModelRate": "Rate",
+    "voiceModelAdd": "Add model",
+    "voiceModelRemove": "Remove model",
+    "voiceModelDefault": "Default model",
+    "voiceModelDefaultHelp": "The default model must name one of the configured models.",
+    "voiceModelInvalid": "Model IDs, rates, and the default model must be valid before saving.",
+    "topupsTitle": "Top-ups and credit",
+    "topupsDescription": "Available credit = cumulative transfers into the Midas public account + cumulative provided value - cumulative consumption.",
+    "creditedUsd": "Cumulative top-ups (USD)",
+    "usageUsd": "Cumulative consumption (USD)",
+    "availableCredit": "Available credit (USD)",
+    "cumulativeTopups": "Cumulative top-ups (USD)",
+    "cumulativeConsumption": "Cumulative consumption (USD)",
+    "requestNotEnforced": "Requests are currently not blocked for insufficient available credit.",
+    "requestEnforced": "Requests are blocked when available credit is insufficient.",
+    "midasFundTitle": "Transfer to the Qwen-LB public account",
+    "midasFundDescription": "Enter an amount to open Midas in a new window. It shows the recipient and amount read-only; sign in and confirm to complete the top-up.",
+    "topupAmount": "Top-up amount (USD)",
+    "topupAmountHint": "Up to 9 decimal places. Midas transfers this exact amount in USD nanodollars.",
+    "continueToMidas": "Continue to Midas",
+    "publicWalletUserId": "Qwen-LB public-account user ID",
+    "copyMidasUserId": "Copy user ID",
+    "midasTransferRefresh": "Refresh this page after the transfer; cumulative top-ups are read from your current Midas inbound transfers.",
+    "midasUnavailable": "Midas is not configured",
+    "midasUnavailableDescription": "Ask root to configure the Midas public-account user ID and fund API key in Settings.",
+    "midasSettings": "Midas",
+    "midasSettingsDescription": "Midas is the only top-up ledger. The public-account user ID is safe to share with payers; the fund API key stays in server SQLite, and a blank key retains the current key.",
+    "midasApiBase": "API base URL",
+    "midasFundUserId": "Public-account user ID",
+    "midasFundApiKey": "Fund API key",
+    "midasConfigured": "Configured",
+    "midasNotConfigured": "Not configured",
+    "midasSettingsSaved": "Midas settings saved",
+    "systemResources": "System resources",
+    "systemResourcesDescription": "Current host load and Qwen-LB data footprint. Visible to root and administrators only.",
+    "refreshEvery5s": "Refreshes every 5 seconds",
+    "sampledAt": "Sampled",
+    "resourceUnavailable": "System resources unavailable",
+    "resourceUnavailableDescription": "Automatic refresh will keep retrying; there is no need to reload the page.",
+    "cpu": "CPU",
+    "memory": "Memory",
+    "network": "Network",
+    "disk": "Disk",
+    "sqlite": "SQLite database",
+    "load1m": "1-minute load",
+    "logicalCpus": "Logical CPUs",
+    "available": "Available",
+    "lbRss": "Qwen-LB RSS",
+    "otherSystemMemory": "Other system usage",
+    "systemAvailableMemory": "System available memory",
+    "swap": "Swap",
+    "received": "Received",
+    "transmitted": "Transmitted",
+    "totalReceived": "Total received",
+    "totalTransmitted": "Total transmitted",
+    "networkInterfaces": "Network interfaces",
+    "mountPoint": "Mount point",
+    "mainFile": "Main file",
+    "walFile": "WAL",
+    "shmFile": "SHM",
+    "reclaimableSpace": "Reclaimable (VACUUM)",
+    "vacuumDatabase": "Run VACUUM",
+    "vacuumDatabaseTitle": "Compact the SQLite database?",
+    "vacuumDatabaseDescription": "This rewrites the database file to reclaim free space. Database writes may wait briefly while it runs.",
+    "vacuumDatabaseComplete": "SQLite database compacted and resource metrics refreshed.",
+    "voiceTitle": "Voice studio",
+    "voiceTranscribe": "Transcription",
+    "voiceSynthesize": "Speech",
+    "voiceTranscribeTitle": "Transcription",
+    "voiceTranscribeDescription": "Upload audio and transcribe it to text with Qwen-ASR; results and cost land in the inference audit.",
+    "voiceAudioFile": "Audio file",
+    "voiceChooseFile": "Choose file",
+    "voiceNoFile": "No file selected yet",
+    "voiceAudioFileHelp": "Common audio formats are supported (wav, mp3, m4a, ogg, webm, flac, …); one file may be up to 24 MiB.",
+    "voiceTranscribeModelHelp": "Choose the transcription model; the configured default is preselected.",
+    "voiceLanguage": "Language hint",
+    "voiceLanguagePlaceholder": "zh / en / empty to auto-detect",
+    "voiceLanguageHelp": "Optional; leave empty or use auto to let Qwen detect the language.",
+    "voiceLanguageInvalid": "Enter a short language tag such as zh or en.",
+    "voiceTranscribing": "Transcribing…",
+    "voiceTranscribeRun": "Transcribe",
+    "voiceFailed": "Call failed",
+    "voiceTranscriptionResult": "Transcription result",
+    "voiceTranscriptionEmpty": "The transcription text appears here.",
+    "voiceAuditHint": "This call is recorded in the inference audit; filter by model to review it.",
+    "voiceOpenAudit": "Review in the inference audit",
+    "voiceSpeechTitle": "Speech synthesis",
+    "voiceSpeechDescription": "Enter text and synthesize it with Qwen3-TTS; the reply is WAV audio.",
+    "voiceInput": "Text",
+    "voiceInputPlaceholder": "For example: Hello from Qwen-LB.",
+    "voiceInputHelp": "Each synthesis is one request; cost is billed per output character.",
+    "voiceCharacters": "characters",
+    "voiceSpeechModelHelp": "Choose the speech model; the configured default is preselected.",
+    "voiceVoice": "Voice",
+    "voiceVoiceHelp": "The default voice is Cherry; any other Qwen voice name works too.",
+    "voiceSynthesizing": "Synthesizing…",
+    "voiceSynthesizeRun": "Synthesize",
+    "voiceSpeechResult": "Synthesized audio",
+    "voiceSpeechEmpty": "The synthesized audio appears here.",
+    "voiceDownload": "Download WAV",
+    "voiceWavNote": "The response format is always WAV.",
+    "voicePricesTitle": "Voice pricing",
+    "voicePricesDescription": "The active voice rate snapshot: transcription bills per audio second, speech synthesis per output character.",
+    "voicePricingSource": "Open the Qwen model docs",
+    "voicePricingSourceUrl": "https://www.qianwenai.com/models/qwen-audio-3.0-asr-flash",
+    "voiceSecondUnit": "second",
+    "voiceCharacterUnit": "character",
+    "voicePricesBilling": "Cost = rate × usage; rates are converted from Qwen's CNY list prices at 7.2 into USD nanodollars and maintained by administrators in Settings.",
+    "voicePricesEditable": "Rates and the default models are adjustable in Settings.",
+    "pricingUnit": "Unit",
+    "providedValue": "Cumulative provided value (USD)",
   },
 } satisfies Record<Locale, Record<string, string>>
+
 
 // Auth Mini tokens must carry both this app's own audience and the Linkit
 // resource audience; a token without linkit.ntnl.io breaks the Linkit
@@ -1997,23 +1729,18 @@ function Console({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
     },
     {
       label: t.navigationIntegrations,
-      items: [
-        ["codex-integration", PencilIcon],
-        ["dsh-integration", KeyRoundIcon],
-        ["opencode-integration", KeyRoundIcon],
-        ["direct-api-integration", BookOpenIcon],
-      ],
+      items: [["direct-api-integration", BookOpenIcon]],
     },
     {
       label: t.navigationTools,
-      items: [["web-search", SearchIcon]],
+      items: [["voice", AudioLinesIcon]],
     },
     {
       label: t.navigationData,
       items: [
         ["usage", ActivityIcon],
         ["audit", ScrollTextIcon],
-        ["model-prices", CpuIcon],
+        ["voice-prices", TagsIcon],
       ],
     },
     ...(isAdministrator
@@ -2048,7 +1775,7 @@ function Console({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
             alt=""
             aria-hidden="true"
             className="size-7 shrink-0"
-            src="/deepseek.svg"
+            src="/qwen.svg"
           />
         ),
         dark: (
@@ -2056,7 +1783,7 @@ function Console({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
             alt=""
             aria-hidden="true"
             className="size-7 shrink-0"
-            src="/deepseek.svg"
+            src="/qwen.svg"
           />
         ),
       }}
@@ -2089,24 +1816,12 @@ function Console({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
               element={<Consumers sdk={sdk} locale={locale} />}
             />
             <Route
-              path="/codex-integration"
-              element={<CodexIntegrationPage sdk={sdk} locale={locale} />}
-            />
-            <Route
-              path="/dsh-integration"
-              element={<DshIntegrationPage sdk={sdk} locale={locale} />}
-            />
-            <Route
-              path="/opencode-integration"
-              element={<OpenCodeIntegrationPage sdk={sdk} locale={locale} />}
-            />
-            <Route
               path="/direct-api-integration"
               element={<DirectApiIntegrationPage locale={locale} />}
             />
             <Route
-              path="/web-search"
-              element={<WebSearchPage sdk={sdk} locale={locale} />}
+              path="/voice"
+              element={<VoicePage sdk={sdk} locale={locale} />}
             />
             <Route
               path="/usage"
@@ -2136,8 +1851,8 @@ function Console({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
               element={<TopupsPage sdk={sdk} locale={locale} />}
             />
             <Route
-              path="/model-prices"
-              element={<ModelPricesPage sdk={sdk} locale={locale} />}
+              path="/voice-prices"
+              element={<VoicePricesPage sdk={sdk} locale={locale} />}
             />
             <Route
               path="/system-resources"
@@ -2204,46 +1919,6 @@ function PageHeader({
   )
 }
 
-type CodexPlatformInstruction = {
-  configPath: string
-  hint: string
-}
-
-type FileIntegrationContent = {
-  integration: string
-  consumerName: string
-  description: string
-  preparationTitle: string
-  preparationDescription: string
-  manualTitle: string
-  manualDescription: string
-  manualConfigInstruction: string
-  manualTokenInstruction: string
-  manualVerifyTitle: string
-  manualVerifyDescription: string
-  copyLabel: string
-  copiedLabel: string
-  automaticTitle: string
-  automaticDescription: string
-  findConfig: string
-  findConfigDescription: string
-  platformInstructions: Record<CodexPlatform, CodexPlatformInstruction>
-  selectConfig: string
-  selectConfigOnly: string
-  configInvalid: string
-  restartTitle: string
-  restartDescription: string
-  configWritten: string
-  configError: string
-  configWriteFailed: string
-  consumerCleanupFailed: string
-  browserRequired: string
-  browserRequiredDescription: string
-  fileName: string
-  pickerDescription: string
-  accept: Record<string, string[]>
-}
-
 type DirectApiContent = {
   preparationTitle: string
   preparationDescription: string
@@ -2251,1022 +1926,51 @@ type DirectApiContent = {
   description: string
   firstStep: string
   secondStep: string
+  thirdStep: string
   modelPlaceholder: string
   sensitiveTitle: string
   sensitiveDescription: string
 }
 
-type DshIntegrationContent = {
-  integration: string
-  consumerName: string
-  description: string
-  preparationTitle: string
-  preparationDescription: string
-  manualTitle: string
-  manualInstruction: string
-  apiKeyInstruction: string
-  modelCatalogInstruction: string
-  automaticTitle: string
-  automaticDescription: string
-  directoryPath: string
-  selectDirectory: string
-  settingsMissing: string
-  configInvalid: string
-  modelListUnavailable: string
-  configWritten: string
-  configError: string
-  configWriteFailed: string
-  configRollbackFailed: string
-  consumerCleanupFailed: string
-  browserRequiredDescription: string
-}
-
-const integrationCopy: Record<
-  Locale,
-  {
-    codex: FileIntegrationContent
-    dsh: DshIntegrationContent
-    opencode: FileIntegrationContent
-    direct: DirectApiContent
-  }
-> = {
+const integrationCopy: Record<Locale, { direct: DirectApiContent }> = {
   zh: {
-    codex: {
-      integration: "Codex",
-      consumerName: "Codex",
-      description:
-        "手动编辑本机 Codex 配置，或授权浏览器读取和写入配置文件并自动创建专用 Consumer。",
-      preparationTitle: "专用 Consumer",
-      preparationDescription:
-        "先在“下游消费者”中为 Codex 创建独立 Consumer 并保存只展示一次的密钥。手动配置需要把密钥粘贴到配置文件；自动配置只会把新密钥写入你已授权的本地文件。",
-      manualTitle: "手动配置",
-      manualDescription:
-        "编辑用户级 ~/.codex/config.toml，将 DeepSeek-LB 设为 Codex 的模型提供方。",
-      manualConfigInstruction:
-        "将以下内容合并到 ~/.codex/config.toml；如果已有其他设置，只更新 model_provider 与 model_providers.deepseek-lb。",
-      manualTokenInstruction:
-        "将 <YOUR_CONSUMER_KEY> 替换为“下游消费者”页面创建的 Consumer 密钥。不要把真实密钥提交到 Git 或共享配置仓库。",
-      manualVerifyTitle: "重启并验证",
-      manualVerifyDescription:
-        "保存配置后重启 Codex。若请求失败，先用 /v1/models 验证该 Consumer 仍有效，再检查 config.toml 中的 base_url、wire_api 和密钥。",
-      copyLabel: "复制",
-      copiedLabel: "已复制",
-      automaticTitle: "浏览器自动配置",
-      automaticDescription:
-        "授权浏览器读取 config.toml 后，页面会创建专用 Consumer 并将配置写回该文件；其他 TOML 配置会保留。",
-      findConfig: "在系统文件选择器中找到 config.toml。",
-      findConfigDescription: "打开以下本机文件：",
-      platformInstructions: {
-        macos: {
-          configPath: "~/.codex/config.toml",
-          hint: "按 ⌘⇧G，输入上方路径后回车；若手动浏览目录，按 ⌘⇧. 显示隐藏文件。",
-        },
-        windows: {
-          configPath: "%USERPROFILE%\\.codex\\config.toml",
-          hint: "将上方路径粘贴到文件名框或地址栏；若未显示 .codex，请在“查看”中启用“隐藏的项目”。",
-        },
-        linux: {
-          configPath: "~/.codex/config.toml",
-          hint: "按 Ctrl+L 输入上方路径；若手动浏览目录，按 Ctrl+H 显示隐藏文件。",
-        },
-        other: {
-          configPath: "~/.codex/config.toml",
-          hint: "在用户主目录中打开 .codex，再选择 config.toml。必要时在文件选择器中显示隐藏文件。",
-        },
-      },
-      selectConfig: "选择 config.toml、创建 Consumer 并写入",
-      selectConfigOnly: "请只选择名为 config.toml 的文件。",
-      configInvalid:
-        "config.toml 无法解析或包含当前流程无法安全更新的配置。文件未修改，也没有创建 Consumer。",
-      restartTitle: "重启 Codex",
-      restartDescription:
-        "页面只会更新 model_provider 与 model_providers.deepseek-lb；其他 TOML 配置保持不变。写入完成后重启 Codex。",
-      configWritten: "已写入本机 Codex 配置；请重启 Codex。",
-      configError: "配置未完成",
-      configWriteFailed:
-        "无法完成配置。请确认已授权文件访问，并选择用户目录下的 .codex/config.toml。",
-      consumerCleanupFailed:
-        "无法写入 config.toml，且自动撤销新建 Consumer 失败。请在“下游消费者”中撤销名称为 Codex 的新记录。",
-      browserRequired: "需要 Chrome 或 Edge",
-      browserRequiredDescription:
-        "此操作依赖浏览器的本地文件访问能力。请用最新版 Chrome 或 Edge 打开此页面后重试。",
-      fileName: "config.toml",
-      pickerDescription: "Codex config.toml",
-      accept: { "application/toml": [".toml"] },
-    },
-    dsh: {
-      integration: "DSH（DeepSeek Harness）",
-      consumerName: "DSH (DeepSeek Harness)",
-      description:
-        "手动添加 DeepSeek-LB Provider，或授权浏览器读取和更新 ~/.dsh 中的 YAML 配置。自动流程会创建一个专用 Consumer，并只把密钥写入本机凭据文件。",
-      preparationTitle: "专用 Consumer",
-      preparationDescription:
-        "先在“下游消费者”中为 DSH 创建独立 Consumer 并保存只展示一次的密钥。手动配置需要粘贴该密钥；自动配置只会把新密钥写入你授权的 ~/.dsh/.credentials.yaml。",
-      manualTitle: "手动配置",
-      manualInstruction:
-        "在 DSH 中打开 设置 → 模型 → 添加自定义提供方，然后填写以下值：",
-      apiKeyInstruction:
-        "API 密钥：在“下游消费者”页面创建或生成一条密钥后粘贴。",
-      modelCatalogInstruction:
-        "保存 Provider 后，点击“获取可用模型”读取当前 Consumer 可调用的模型目录。",
-      automaticTitle: "自动写入 ~/.dsh",
-      automaticDescription:
-        "选择 ~/.dsh 目录后，页面会解析 settings.yaml、创建专用 Consumer，并更新 settings.yaml 与 .credentials.yaml。其他 YAML 配置会保留。",
-      directoryPath: "~/.dsh",
-      selectDirectory: "选择 ~/.dsh 并自动配置",
-      settingsMissing:
-        "所选目录中没有 settings.yaml。文件未修改，也没有创建 Consumer。",
-      configInvalid:
-        "settings.yaml 或 .credentials.yaml 无法解析，或包含当前流程无法安全更新的结构。文件未修改，也没有创建 Consumer。",
-      modelListUnavailable: "当前无法读取可用模型，暂不能自动写入 DSH 配置。",
-      configWritten: "已写入 DSH 配置与专用 Consumer 密钥；请重启 DSH。",
-      configError: "DSH 配置未完成",
-      configWriteFailed:
-        "无法完成配置。请确认已授权目录访问，并选择用户目录下的 ~/.dsh。",
-      configRollbackFailed:
-        "写入 .credentials.yaml 失败，且无法恢复 settings.yaml。请检查 ~/.dsh 中的 DeepSeek-LB 配置后再重试。",
-      consumerCleanupFailed:
-        "无法完成配置，且自动撤销新建 Consumer 失败。请在“下游消费者”中撤销名称为 DSH (DeepSeek Harness) 的新记录。",
-      browserRequiredDescription:
-        "此操作依赖浏览器的本地目录访问能力。请用最新版 Chrome 或 Edge 打开此页面后重试。",
-    },
-    opencode: {
-      integration: "OpenCode",
-      consumerName: "OpenCode",
-      description:
-        "手动编辑本机 OpenCode 配置，或授权浏览器读取和写入 JSONC 文件并自动创建专用 Consumer。",
-      preparationTitle: "专用 Consumer",
-      preparationDescription:
-        "先在“下游消费者”中为 OpenCode 创建独立 Consumer 并保存只展示一次的密钥。手动配置需要把密钥粘贴到 JSONC 文件；自动配置只会把新密钥写入你已授权的本地文件。",
-      manualTitle: "手动配置",
-      manualDescription:
-        "编辑用户级 ~/.config/opencode/opencode.jsonc，将 DeepSeek-LB 添加为 OpenAI 兼容 Provider。",
-      manualConfigInstruction:
-        "将以下 provider.deepseek-lb 片段合并到 ~/.config/opencode/opencode.jsonc，并把示例模型替换为 /v1/models 返回的可用 model id。",
-      manualTokenInstruction:
-        "将 <YOUR_CONSUMER_KEY> 替换为“下游消费者”页面创建的 Consumer 密钥。不要把真实密钥提交到 Git 或共享配置仓库。",
-      manualVerifyTitle: "重启并验证",
-      manualVerifyDescription:
-        "保存配置后重启 OpenCode，并选择 deepseek-lb/deepseek-flash（或模型目录中的其他可用模型）。若请求失败，先用 /v1/models 验证 Consumer 和 baseURL。",
-      copyLabel: "复制",
-      copiedLabel: "已复制",
-      automaticTitle: "浏览器自动配置",
-      automaticDescription:
-        "授权浏览器读取 opencode.jsonc 后，页面会创建专用 Consumer 并将 provider.deepseek-lb 写回该文件；其他 JSONC 配置会保留。",
-      findConfig: "在系统文件选择器中找到 opencode.jsonc。",
-      findConfigDescription: "打开以下本机文件：",
-      platformInstructions: {
-        macos: {
-          configPath: "~/.config/opencode/opencode.jsonc",
-          hint: "按 ⌘⇧G，输入上方路径后回车；若手动浏览目录，按 ⌘⇧. 显示隐藏文件。",
-        },
-        windows: {
-          configPath: "%APPDATA%\\opencode\\opencode.jsonc",
-          hint: "将上方路径粘贴到文件名框或地址栏；AppData 默认隐藏，可在“查看”中启用“隐藏的项目”。",
-        },
-        linux: {
-          configPath: "~/.config/opencode/opencode.jsonc",
-          hint: "按 Ctrl+L 输入上方路径；若手动浏览目录，按 Ctrl+H 显示隐藏文件。",
-        },
-        other: {
-          configPath: "~/.config/opencode/opencode.jsonc",
-          hint: "在用户主目录中打开 .config/opencode，再选择 opencode.jsonc。必要时在文件选择器中显示隐藏文件。",
-        },
-      },
-      selectConfig: "选择 opencode.jsonc、创建 Consumer 并写入",
-      selectConfigOnly: "请只选择名为 opencode.jsonc 的文件。",
-      configInvalid:
-        "opencode.jsonc 无法解析或包含当前流程无法安全更新的配置。文件未修改，也没有创建 Consumer。",
-      restartTitle: "重启 OpenCode",
-      restartDescription:
-        "页面只会更新 provider.deepseek-lb；其他 JSONC 配置保持不变。写入完成后重启 OpenCode。",
-      configWritten: "已写入本机 OpenCode 配置；请重启 OpenCode。",
-      configError: "配置未完成",
-      configWriteFailed:
-        "无法完成配置。请确认已授权文件访问，并选择用户目录下的 .config/opencode/opencode.jsonc。",
-      consumerCleanupFailed:
-        "无法写入 opencode.jsonc，且自动撤销新建 Consumer 失败。请在“下游消费者”中撤销名称为 OpenCode 的新记录。",
-      browserRequired: "需要 Chrome 或 Edge",
-      browserRequiredDescription:
-        "此操作依赖浏览器的本地文件访问能力。请用最新版 Chrome 或 Edge 打开此页面后重试。",
-      fileName: "opencode.jsonc",
-      pickerDescription: "OpenCode opencode.jsonc",
-      accept: { "application/json": [".jsonc"] },
-    },
     direct: {
       preparationTitle: "创建 Consumer",
       preparationDescription:
-        "在“下游消费者”中为这类直接 API 调用创建独立 Consumer，并立即保存只展示一次的密钥。以下示例以 <YOUR_CONSUMER_KEY> 表示该密钥。",
+        "在“下游消费者”中为录音类应用创建独立 Consumer，并立即保存只展示一次的密钥。以下示例以 <YOUR_CONSUMER_KEY> 表示该密钥。",
       title: "直接 API 调用",
       description:
-        "DeepSeek-LB 代理 OpenAI /v1 兼容接口。直接用 Bearer Consumer 密钥调用所需端点，无需编辑任何本地配置文件。",
-      firstStep: "先验证服务可访问的模型列表。",
+        "Qwen-LB 把 Qwen 语音能力封装为标准 OpenAI 音频接口：/v1/audio/transcriptions 转写、/v1/audio/speech 合成。用 Bearer Consumer 密钥直接调用，不需要任何本地配置文件。",
+      firstStep: "先确认该 Consumer 可用的模型目录。",
       secondStep:
-        "再调用对话补全；Codex 等客户端可使用代理后的 /v1/responses 端点。",
+        "上传一段音频做转写：multipart 的 file 字段必填，可选 model 与 language（如 zh、en，或留空自动识别）。",
+      thirdStep:
+        "把文本合成为语音：请求体是 JSON，返回 WAV 音频字节流；voice 缺省为 Cherry。",
       modelPlaceholder: "替换为可用模型 ID",
       sensitiveTitle: "密钥与排障边界",
       sensitiveDescription:
-        "Consumer 密钥只应放在本机安全存储、密钥管理器或受控环境变量中。不要提交到 Git、粘贴到工单或放入浏览器。请求状态、Provider 选择、耗时与用量可在“审计”中追踪。",
+        "Consumer 密钥只应放在本机安全存储、密钥管理器或受控环境变量中。不要提交到 Git、粘贴到工单或放入浏览器。每次调用的状态、上游提供商、耗时与费用都在“推理审计”中可查；原始请求 ID 通过响应头 x-qwen-lb-request-id 返回。",
     },
   },
   en: {
-    codex: {
-      integration: "Codex",
-      consumerName: "Codex",
-      description:
-        "Edit the local Codex configuration manually, or authorize the browser to write it and create a dedicated Consumer automatically.",
-      preparationTitle: "Dedicated Consumer",
-      preparationDescription:
-        "First create a dedicated Consumer for Codex on the Consumers page and save its one-time secret. Manual setup pastes it into the config file; automatic setup writes the new secret only to the local file you authorize.",
-      manualTitle: "Manual configuration",
-      manualDescription:
-        "Edit the user-level ~/.codex/config.toml and point Codex at DeepSeek-LB.",
-      manualConfigInstruction:
-        "Merge this into ~/.codex/config.toml. If other settings already exist, update only model_provider and model_providers.deepseek-lb.",
-      manualTokenInstruction:
-        "Replace <YOUR_CONSUMER_KEY> with the Consumer secret created on the Consumers page. Never commit a real secret to Git or a shared config repository.",
-      manualVerifyTitle: "Restart and verify",
-      manualVerifyDescription:
-        "Save the file and restart Codex. If a request fails, verify the Consumer with /v1/models, then check base_url, wire_api, and the key in config.toml.",
-      copyLabel: "Copy",
-      copiedLabel: "Copied",
-      automaticTitle: "Configure in the browser",
-      automaticDescription:
-        "After you authorize config.toml, the page creates a dedicated Consumer and writes the configuration back while retaining other TOML settings.",
-      findConfig: "Find config.toml in the system file picker.",
-      findConfigDescription: "Open this local file:",
-      platformInstructions: {
-        macos: {
-          configPath: "~/.codex/config.toml",
-          hint: "Press ⌘⇧G, enter the path above, then press Return. If you browse manually, press ⌘⇧. to show hidden files.",
-        },
-        windows: {
-          configPath: "%USERPROFILE%\\.codex\\config.toml",
-          hint: "Paste the path above into the File name box or address bar. If .codex is not visible, enable View > Hidden items.",
-        },
-        linux: {
-          configPath: "~/.codex/config.toml",
-          hint: "Press Ctrl+L to enter the path above. If you browse manually, press Ctrl+H to show hidden files.",
-        },
-        other: {
-          configPath: "~/.codex/config.toml",
-          hint: "Open .codex in your home directory, then choose config.toml. Show hidden files in the picker if needed.",
-        },
-      },
-      selectConfig: "Choose config.toml, create Consumer, and write",
-      selectConfigOnly: "Choose only the file named config.toml.",
-      configInvalid:
-        "config.toml could not be parsed or cannot be safely updated by this flow. The file was not changed and no Consumer was created.",
-      restartTitle: "Restart Codex",
-      restartDescription:
-        "Only model_provider and model_providers.deepseek-lb are updated. All other TOML settings stay unchanged. Restart Codex after the write completes.",
-      configWritten:
-        "Your local Codex configuration is updated. Restart Codex to use it.",
-      configError: "Configuration was not completed",
-      configWriteFailed:
-        "Could not complete configuration. Confirm file access was allowed and select .codex/config.toml from your home directory.",
-      consumerCleanupFailed:
-        "config.toml could not be written and the new Consumer could not be deleted automatically. Delete the new Consumer named Codex on the Consumers page.",
-      browserRequired: "Chrome or Edge is required",
-      browserRequiredDescription:
-        "This action requires browser access to local files. Open this page in the latest Chrome or Edge and try again.",
-      fileName: "config.toml",
-      pickerDescription: "Codex config.toml",
-      accept: { "application/toml": [".toml"] },
-    },
-    dsh: {
-      integration: "DSH (DeepSeek Harness)",
-      consumerName: "DSH (DeepSeek Harness)",
-      description:
-        "Add a DeepSeek-LB provider manually or authorize the browser to read and update the YAML configuration in ~/.dsh. The automatic flow creates a dedicated Consumer and writes its secret only to the local credentials file.",
-      preparationTitle: "Dedicated Consumer",
-      preparationDescription:
-        "First create a dedicated Consumer for DSH on the Consumers page and save its one-time secret. Manual setup pastes that secret; automatic setup writes the new secret only to the ~/.dsh/.credentials.yaml file you authorize.",
-      manualTitle: "Manual configuration",
-      manualInstruction:
-        "In DSH, open Settings → Models → Add custom provider, then enter these values:",
-      apiKeyInstruction:
-        "API key: create or generate a key on the Consumers page, then paste it here.",
-      modelCatalogInstruction:
-        "After saving the Provider, click Get available models to read the models available to this Consumer.",
-      automaticTitle: "Write ~/.dsh automatically",
-      automaticDescription:
-        "After you choose ~/.dsh, this page parses settings.yaml, creates a dedicated Consumer, and updates settings.yaml plus .credentials.yaml. Other YAML configuration is retained.",
-      directoryPath: "~/.dsh",
-      selectDirectory: "Choose ~/.dsh and configure automatically",
-      settingsMissing:
-        "The selected directory does not contain settings.yaml. No file was changed and no Consumer was created.",
-      configInvalid:
-        "settings.yaml or .credentials.yaml could not be parsed, or contains a structure this flow cannot safely update. No file was changed and no Consumer was created.",
-      modelListUnavailable:
-        "The available model list could not be read, so DSH configuration cannot be written automatically yet.",
-      configWritten:
-        "DSH configuration and the dedicated Consumer key are written. Restart DSH to use them.",
-      configError: "DSH configuration was not completed",
-      configWriteFailed:
-        "Could not complete configuration. Confirm directory access was allowed and choose ~/.dsh from your home directory.",
-      configRollbackFailed:
-        "Writing .credentials.yaml failed and settings.yaml could not be restored. Check the DeepSeek-LB configuration in ~/.dsh before retrying.",
-      consumerCleanupFailed:
-        "Configuration could not be completed and the new Consumer could not be deleted automatically. Delete the Consumer named DSH (DeepSeek Harness) on the Consumers page.",
-      browserRequiredDescription:
-        "This action requires browser access to local directories. Open this page in the latest Chrome or Edge and try again.",
-    },
-    opencode: {
-      integration: "OpenCode",
-      consumerName: "OpenCode",
-      description:
-        "Edit the local OpenCode configuration manually, or authorize the browser to write the JSONC file and create a dedicated Consumer automatically.",
-      preparationTitle: "Dedicated Consumer",
-      preparationDescription:
-        "First create a dedicated Consumer for OpenCode on the Consumers page and save its one-time secret. Manual setup pastes it into the JSONC file; automatic setup writes the new secret only to the local file you authorize.",
-      manualTitle: "Manual configuration",
-      manualDescription:
-        "Edit the user-level ~/.config/opencode/opencode.jsonc and add DeepSeek-LB as an OpenAI-compatible provider.",
-      manualConfigInstruction:
-        "Merge this provider.deepseek-lb block into ~/.config/opencode/opencode.jsonc and replace the example with a model ID returned by /v1/models.",
-      manualTokenInstruction:
-        "Replace <YOUR_CONSUMER_KEY> with the Consumer secret created on the Consumers page. Never commit a real secret to Git or a shared config repository.",
-      manualVerifyTitle: "Restart and verify",
-      manualVerifyDescription:
-        "Save the file, restart OpenCode, and choose deepseek-lb/deepseek-flash (or another available model). If a request fails, verify the Consumer and baseURL with /v1/models.",
-      copyLabel: "Copy",
-      copiedLabel: "Copied",
-      automaticTitle: "Configure in the browser",
-      automaticDescription:
-        "After you authorize opencode.jsonc, the page creates a dedicated Consumer and writes provider.deepseek-lb back while retaining other JSONC settings.",
-      findConfig: "Find opencode.jsonc in the system file picker.",
-      findConfigDescription: "Open this local file:",
-      platformInstructions: {
-        macos: {
-          configPath: "~/.config/opencode/opencode.jsonc",
-          hint: "Press ⌘⇧G, enter the path above, then press Return. If you browse manually, press ⌘⇧. to show hidden files.",
-        },
-        windows: {
-          configPath: "%APPDATA%\\opencode\\opencode.jsonc",
-          hint: "Paste the path above into the File name box or address bar. AppData is hidden by default; enable View > Hidden items.",
-        },
-        linux: {
-          configPath: "~/.config/opencode/opencode.jsonc",
-          hint: "Press Ctrl+L to enter the path above. If you browse manually, press Ctrl+H to show hidden files.",
-        },
-        other: {
-          configPath: "~/.config/opencode/opencode.jsonc",
-          hint: "Open .config/opencode in your home directory, then choose opencode.jsonc. Show hidden files in the picker if needed.",
-        },
-      },
-      selectConfig: "Choose opencode.jsonc, create Consumer, and write",
-      selectConfigOnly: "Choose only the file named opencode.jsonc.",
-      configInvalid:
-        "opencode.jsonc could not be parsed or cannot be safely updated by this flow. The file was not changed and no Consumer was created.",
-      restartTitle: "Restart OpenCode",
-      restartDescription:
-        "Only provider.deepseek-lb is updated. All other JSONC settings stay unchanged. Restart OpenCode after the write completes.",
-      configWritten:
-        "Your local OpenCode configuration is updated. Restart OpenCode to use it.",
-      configError: "Configuration was not completed",
-      configWriteFailed:
-        "Could not complete configuration. Confirm file access was allowed and select .config/opencode/opencode.jsonc from your home directory.",
-      consumerCleanupFailed:
-        "opencode.jsonc could not be written and the new Consumer could not be deleted automatically. Delete the new Consumer named OpenCode on the Consumers page.",
-      browserRequired: "Chrome or Edge is required",
-      browserRequiredDescription:
-        "This action requires browser access to local files. Open this page in the latest Chrome or Edge and try again.",
-      fileName: "opencode.jsonc",
-      pickerDescription: "OpenCode opencode.jsonc",
-      accept: { "application/json": [".jsonc"] },
-    },
     direct: {
       preparationTitle: "Create a Consumer",
       preparationDescription:
-        "Create a dedicated Consumer for direct API calls on the Consumers page and save its one-time secret immediately. The examples below use <YOUR_CONSUMER_KEY> for that secret.",
+        "Create a dedicated Consumer for voice apps on the Consumers page and save its one-time secret immediately. The examples below use <YOUR_CONSUMER_KEY> for that secret.",
       title: "Direct API calls",
       description:
-        "DeepSeek-LB proxies the DeepSeek OpenAI-compatible API under /v1. Authenticate with a Bearer Consumer secret; no local configuration file is edited.",
-      firstStep: "First confirm the model list the service exposes.",
+        "Qwen-LB wraps Qwen voice capabilities in the standard OpenAI audio surfaces: /v1/audio/transcriptions to transcribe and /v1/audio/speech to synthesize. Authenticate with a Bearer Consumer secret; no local configuration file is needed.",
+      firstStep: "First confirm the model list this Consumer can call.",
       secondStep:
-        "Then run a chat completion; clients such as Codex use the proxied /v1/responses endpoint.",
+        "Upload audio to transcribe: the multipart file field is required; model and language (e.g. zh, en, or empty for auto-detect) are optional.",
+      thirdStep:
+        "Synthesize text to speech: the request body is JSON and the reply is WAV audio bytes; the default voice is Cherry.",
       modelPlaceholder: "replace with an available model ID",
       sensitiveTitle: "Key handling and troubleshooting",
       sensitiveDescription:
-        "Keep Consumer secrets only in secure local storage, a secrets manager, or controlled environment variables. Never commit them to Git, paste them into tickets, or put them in browser code. Trace request state, provider selection, latency, and usage in Audit.",
+        "Keep Consumer secrets only in secure local storage, a secrets manager, or controlled environment variables. Never commit them to Git, paste them into tickets, or put them in browser code. Every call's status, provider, latency, and cost are visible in the inference audit; the original request ID returns in the x-qwen-lb-request-id response header.",
     },
   },
-}
-
-type ConfigFileHandle = {
-  name: string
-  getFile: () => Promise<File>
-  createWritable: () => Promise<{
-    write: (data: string) => Promise<void>
-    close: () => Promise<void>
-  }>
-}
-
-type FilePickerWindow = Window & {
-  showOpenFilePicker?: (options: {
-    multiple: boolean
-    types: Array<{
-      description: string
-      accept: Record<string, string[]>
-    }>
-  }) => Promise<ConfigFileHandle[]>
-}
-
-type ConfigDirectoryHandle = {
-  getFileHandle: (
-    name: string,
-    options?: { create?: boolean }
-  ) => Promise<ConfigFileHandle>
-}
-
-type DirectoryPickerWindow = Window & {
-  showDirectoryPicker?: (options: {
-    mode: "readwrite"
-  }) => Promise<ConfigDirectoryHandle>
-}
-
-type FileIntegrationConfig = {
-  modelIds: string[]
-  updateConfig: (content: string, token: string) => string
-  manualConfig: (origin: string) => string
-}
-
-function CodexIntegrationPage({
-  sdk,
-  locale,
-}: {
-  sdk: AuthSdk
-  locale: Locale
-}) {
-  const content = integrationCopy[locale].codex
-  const origin = window.location.origin
-
-  return (
-    <FileIntegrationPage
-      sdk={sdk}
-      content={content}
-      config={{
-        modelIds: [],
-        updateConfig: (config, token) =>
-          updateCodexConfig(config, token, origin),
-        manualConfig: (manualOrigin) =>
-          codexProviderBlock(manualOrigin, "<YOUR_CONSUMER_KEY>"),
-      }}
-    />
-  )
-}
-
-function OpenCodeIntegrationPage({
-  sdk,
-  locale,
-}: {
-  sdk: AuthSdk
-  locale: Locale
-}) {
-  const content = integrationCopy[locale].opencode
-  const origin = window.location.origin
-  const { data: settings } = useApiQuery<SettingsData>(sdk, "/api/settings")
-  const modelIds = settings?.available_model_ids ?? []
-
-  return (
-    <FileIntegrationPage
-      sdk={sdk}
-      content={content}
-      config={{
-        modelIds,
-        updateConfig: (config, token) =>
-          updateOpenCodeConfig(config, token, origin, modelIds),
-        manualConfig: (configOrigin) => `{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "deepseek-lb": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "DeepSeek-LB",
-      "options": {
-        "baseURL": "${configOrigin}/v1",
-        "apiKey": "<YOUR_CONSUMER_KEY>"
-      },
-      "models": {
-${modelIds.map((model) => `        "${model}": { "name": "${model}" }`).join(",\n")}
-      }
-    }
-  }
-}`,
-      }}
-    />
-  )
-}
-
-function DshIntegrationPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
-  const content = integrationCopy[locale].dsh
-  const {
-    data: settings,
-    error: settingsError,
-    loading: settingsLoading,
-  } = useApiQuery<SettingsData>(sdk, "/api/settings")
-
-  return (
-    <DshIntegrationGuide
-      sdk={sdk}
-      content={content}
-      modelIds={settings?.available_model_ids ?? []}
-      modelListLoading={settingsLoading}
-      modelListError={settingsError}
-    />
-  )
-}
-
-function FileIntegrationPage({
-  sdk,
-  content,
-  config,
-}: {
-  sdk: AuthSdk
-  content: FileIntegrationContent
-  config: FileIntegrationConfig
-}) {
-  const instruction =
-    content.platformInstructions[codexPlatform(navigator.userAgent)]
-  const manualConfig = config.manualConfig(window.location.origin)
-
-  return (
-    <div className="flex max-w-4xl flex-col gap-5">
-      <Alert>
-        <KeyRoundIcon />
-        <AlertTitle>{content.preparationTitle}</AlertTitle>
-        <AlertDescription>{content.preparationDescription}</AlertDescription>
-      </Alert>
-      <IntegrationPanel
-        title={content.integration}
-        description={content.description}
-      >
-        <Tabs defaultValue="manual">
-          <TabsList
-            className="max-w-full overflow-x-auto"
-            aria-label={content.integration}
-          >
-            <TabsTrigger value="manual">{content.manualTitle}</TabsTrigger>
-            <TabsTrigger value="automatic">
-              {content.automaticTitle}
-            </TabsTrigger>
-          </TabsList>
-          <TabsContent value="manual" className="flex flex-col gap-5 pt-3">
-            <p className="text-sm text-muted-foreground">
-              {content.manualDescription}
-            </p>
-            <IntegrationStep
-              number={1}
-              description={content.manualConfigInstruction}
-            >
-              <CopyableCode
-                code={manualConfig}
-                copyLabel={content.copyLabel}
-                copiedLabel={content.copiedLabel}
-              />
-            </IntegrationStep>
-            <IntegrationStep
-              number={2}
-              description={content.manualTokenInstruction}
-            />
-            <Alert>
-              <ShieldCheckIcon />
-              <AlertTitle>{content.manualVerifyTitle}</AlertTitle>
-              <AlertDescription>
-                {content.manualVerifyDescription}
-              </AlertDescription>
-            </Alert>
-          </TabsContent>
-          <TabsContent value="automatic" className="flex flex-col gap-5 pt-3">
-            <p className="text-sm text-muted-foreground">
-              {content.automaticDescription}
-            </p>
-            <IntegrationStep number={1} description={content.findConfig}>
-              <p className="text-sm text-muted-foreground">
-                {content.findConfigDescription}
-              </p>
-              <Alert>
-                <PencilIcon />
-                <AlertTitle>
-                  <code>{instruction.configPath}</code>
-                </AlertTitle>
-                <AlertDescription>{instruction.hint}</AlertDescription>
-              </Alert>
-            </IntegrationStep>
-            <IntegrationStep number={2} description={content.selectConfig}>
-              <FileConfigWriter sdk={sdk} content={content} config={config} />
-            </IntegrationStep>
-            <Alert>
-              <ShieldCheckIcon />
-              <AlertTitle>{content.restartTitle}</AlertTitle>
-              <AlertDescription>{content.restartDescription}</AlertDescription>
-            </Alert>
-          </TabsContent>
-        </Tabs>
-      </IntegrationPanel>
-    </div>
-  )
-}
-
-function FileConfigWriter({
-  sdk,
-  content,
-  config,
-}: {
-  sdk: AuthSdk
-  content: FileIntegrationContent
-  config: FileIntegrationConfig
-}) {
-  const [pending, setPending] = useState(false)
-  const [error, setError] = useState("")
-
-  async function configureIntegration() {
-    const filePickerWindow = window as FilePickerWindow
-    if (!filePickerWindow.showOpenFilePicker) {
-      setError(content.browserRequiredDescription)
-      return
-    }
-
-    setError("")
-    setPending(true)
-    let consumer: { id: string; secret: string } | undefined
-
-    try {
-      const [handle] = await filePickerWindow.showOpenFilePicker({
-        multiple: false,
-        types: [
-          {
-            description: content.pickerDescription,
-            accept: content.accept,
-          },
-        ],
-      })
-      if (!handle || handle.name !== content.fileName) {
-        setError(content.selectConfigOnly)
-        return
-      }
-
-      const source = await (await handle.getFile()).text()
-      try {
-        config.updateConfig(source, "sk-pending")
-      } catch {
-        setError(content.configInvalid)
-        return
-      }
-
-      consumer = await api<{ id: string; secret: string }>(
-        sdk,
-        "/api/consumers",
-        {
-          method: "POST",
-          body: JSON.stringify({ name: content.consumerName }),
-        }
-      )
-      if (!isConsumerToken(consumer.secret))
-        throw new Error("Invalid Consumer token")
-
-      const writable = await handle.createWritable()
-      await writable.write(config.updateConfig(source, consumer.secret))
-      await writable.close()
-      consumer = undefined
-      toast.success(content.configWritten)
-    } catch (cause) {
-      if (isAbortError(cause)) return
-
-      if (consumer) {
-        try {
-          await api(sdk, "/api/consumers/" + consumer.id, { method: "DELETE" })
-        } catch {
-          setError(content.consumerCleanupFailed)
-          return
-        }
-      }
-      setError(content.configWriteFailed)
-    } finally {
-      setPending(false)
-    }
-  }
-
-  return (
-    <section
-      className="flex max-w-3xl flex-col gap-3"
-      aria-label={content.integration}
-    >
-      {error && (
-        <Alert variant="destructive">
-          <XCircleIcon />
-          <AlertTitle>{content.configError}</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      )}
-      <Button disabled={pending} onClick={() => void configureIntegration()}>
-        {pending ? (
-          <Spinner data-icon="inline-start" />
-        ) : (
-          <PencilIcon data-icon="inline-start" />
-        )}
-        {content.selectConfig}
-      </Button>
-    </section>
-  )
-}
-
-function DshIntegrationGuide({
-  sdk,
-  content,
-  modelIds,
-  modelListLoading,
-  modelListError,
-}: {
-  sdk: AuthSdk
-  content: DshIntegrationContent
-  modelIds: string[]
-  modelListLoading: boolean
-  modelListError: string
-}) {
-  const providerFields = [
-    ["Provider ID", "deepseek-lb"],
-    ["API URL", `${window.location.origin}/v1`],
-    ["API protocol", "openai-responses"],
-  ]
-
-  return (
-    <div className="flex max-w-4xl flex-col gap-5">
-      <Alert>
-        <KeyRoundIcon />
-        <AlertTitle>{content.preparationTitle}</AlertTitle>
-        <AlertDescription>{content.preparationDescription}</AlertDescription>
-      </Alert>
-      <IntegrationPanel
-        title={content.integration}
-        description={content.description}
-      >
-        <Tabs defaultValue="manual">
-          <TabsList
-            className="max-w-full overflow-x-auto"
-            aria-label={content.integration}
-          >
-            <TabsTrigger value="manual">{content.manualTitle}</TabsTrigger>
-            <TabsTrigger value="automatic">
-              {content.automaticTitle}
-            </TabsTrigger>
-          </TabsList>
-          <TabsContent value="manual" className="flex flex-col gap-3 pt-3">
-            <p className="text-sm text-muted-foreground">
-              {content.manualInstruction}
-            </p>
-            <dl className="grid gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-3">
-              {providerFields.map(([label, value]) => (
-                <div
-                  key={label}
-                  className="flex flex-col gap-1 bg-background p-3"
-                >
-                  <dt className="text-xs text-muted-foreground">{label}</dt>
-                  <dd className="font-mono text-sm">{value}</dd>
-                </div>
-              ))}
-            </dl>
-            <p className="text-sm text-muted-foreground">
-              {content.apiKeyInstruction}
-            </p>
-            <p className="text-sm text-muted-foreground">
-              {content.modelCatalogInstruction}
-            </p>
-          </TabsContent>
-          <TabsContent value="automatic" className="flex flex-col gap-3 pt-3">
-            <p className="text-sm text-muted-foreground">
-              {content.automaticDescription}
-            </p>
-            <Alert>
-              <PencilIcon />
-              <AlertTitle>
-                <code>{content.directoryPath}</code>
-              </AlertTitle>
-              <AlertDescription>
-                settings.yaml · .credentials.yaml
-              </AlertDescription>
-            </Alert>
-            <DshConfigWriter
-              sdk={sdk}
-              content={content}
-              modelIds={modelIds}
-              modelListLoading={modelListLoading}
-              modelListError={modelListError}
-            />
-            <Alert>
-              <ShieldCheckIcon />
-              <AlertTitle>{content.automaticTitle}</AlertTitle>
-              <AlertDescription>{content.configWritten}</AlertDescription>
-            </Alert>
-          </TabsContent>
-        </Tabs>
-      </IntegrationPanel>
-    </div>
-  )
-}
-
-function DshConfigWriter({
-  sdk,
-  content,
-  modelIds,
-  modelListLoading,
-  modelListError,
-}: {
-  sdk: AuthSdk
-  content: DshIntegrationContent
-  modelIds: string[]
-  modelListLoading: boolean
-  modelListError: string
-}) {
-  const [pending, setPending] = useState(false)
-  const [error, setError] = useState("")
-  const modelListAvailable =
-    !modelListLoading && !modelListError && modelIds.length > 0
-
-  async function configureIntegration() {
-    const directoryPickerWindow = window as DirectoryPickerWindow
-    if (!directoryPickerWindow.showDirectoryPicker) {
-      setError(content.browserRequiredDescription)
-      return
-    }
-    if (!modelListAvailable) {
-      setError(content.modelListUnavailable)
-      return
-    }
-
-    setError("")
-    setPending(true)
-    let consumer: { id: string; secret: string } | undefined
-    let settingsHandle: ConfigFileHandle | undefined
-    let credentialsHandle: ConfigFileHandle | undefined
-    let settingsSource = ""
-    let credentialsSource = ""
-    let credentialsMissing = false
-    let settingsWritten = false
-
-    try {
-      const directory = await directoryPickerWindow.showDirectoryPicker({
-        mode: "readwrite",
-      })
-      try {
-        settingsHandle = await directory.getFileHandle("settings.yaml")
-      } catch {
-        setError(content.settingsMissing)
-        return
-      }
-
-      settingsSource = await readConfigFile(settingsHandle)
-      try {
-        updateDshSettings(
-          settingsSource,
-          "sk-pending",
-          dshModels(modelIds),
-          window.location.origin
-        )
-        try {
-          credentialsHandle = await directory.getFileHandle(".credentials.yaml")
-          credentialsSource = await readConfigFile(credentialsHandle)
-        } catch (cause) {
-          if (
-            !(cause instanceof DOMException) ||
-            cause.name !== "NotFoundError"
-          ) {
-            throw cause
-          }
-          credentialsMissing = true
-        }
-        updateDshCredentials(credentialsSource, "sk-pending")
-      } catch {
-        setError(content.configInvalid)
-        return
-      }
-
-      consumer = await api<{ id: string; secret: string }>(
-        sdk,
-        "/api/consumers",
-        {
-          method: "POST",
-          body: JSON.stringify({ name: content.consumerName }),
-        }
-      )
-      if (!isConsumerToken(consumer.secret)) {
-        throw new Error("Invalid Consumer token")
-      }
-      if (credentialsMissing) {
-        credentialsHandle = await directory.getFileHandle(".credentials.yaml", {
-          create: true,
-        })
-      }
-      if (!credentialsHandle) {
-        throw new Error("Missing DSH credentials handle")
-      }
-
-      await writeConfigFile(
-        settingsHandle,
-        updateDshSettings(
-          settingsSource,
-          consumer.secret,
-          dshModels(modelIds),
-          window.location.origin
-        )
-      )
-      settingsWritten = true
-      await writeConfigFile(
-        credentialsHandle,
-        updateDshCredentials(credentialsSource, consumer.secret)
-      )
-      consumer = undefined
-      toast.success(content.configWritten)
-    } catch (cause) {
-      if (isAbortError(cause)) return
-
-      if (
-        settingsWritten &&
-        settingsHandle &&
-        credentialsHandle &&
-        !(await restoreDshFiles(
-          settingsHandle,
-          settingsSource,
-          credentialsHandle,
-          credentialsSource
-        ))
-      ) {
-        setError(content.configRollbackFailed)
-        return
-      }
-      if (consumer) {
-        try {
-          await api(sdk, "/api/consumers/" + consumer.id, {
-            method: "DELETE",
-          })
-        } catch {
-          setError(content.consumerCleanupFailed)
-          return
-        }
-      }
-      setError(content.configWriteFailed)
-    } finally {
-      setPending(false)
-    }
-  }
-
-  return (
-    <section
-      className="flex max-w-3xl flex-col gap-3"
-      aria-label={content.automaticTitle}
-    >
-      {error && (
-        <Alert variant="destructive">
-          <XCircleIcon />
-          <AlertTitle>{content.configError}</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      )}
-      {!modelListAvailable && !modelListLoading && (
-        <Alert variant="destructive">
-          <XCircleIcon />
-          <AlertTitle>{content.configError}</AlertTitle>
-          <AlertDescription>{content.modelListUnavailable}</AlertDescription>
-        </Alert>
-      )}
-      <Button
-        disabled={pending || !modelListAvailable}
-        onClick={() => void configureIntegration()}
-      >
-        {pending || modelListLoading ? (
-          <Spinner data-icon="inline-start" />
-        ) : (
-          <PencilIcon data-icon="inline-start" />
-        )}
-        {content.selectDirectory}
-      </Button>
-    </section>
-  )
-}
-
-async function readConfigFile(handle: ConfigFileHandle) {
-  return (await handle.getFile()).text()
-}
-
-async function writeConfigFile(handle: ConfigFileHandle, content: string) {
-  const writable = await handle.createWritable()
-  await writable.write(content)
-  await writable.close()
-}
-
-async function restoreDshFiles(
-  settingsHandle: ConfigFileHandle,
-  settingsSource: string,
-  credentialsHandle: ConfigFileHandle,
-  credentialsSource: string
-) {
-  try {
-    await writeConfigFile(settingsHandle, settingsSource)
-    await writeConfigFile(credentialsHandle, credentialsSource)
-    return true
-  } catch {
-    return false
-  }
 }
 
 function DirectApiIntegrationPage({ locale }: { locale: Locale }) {
@@ -3278,10 +1982,14 @@ function DirectApiIntegrationPage({ locale }: { locale: Locale }) {
     "curl " +
     origin +
     '/v1/models \\\n  -H "Authorization: Bearer <YOUR_CONSUMER_KEY>"'
-  const chat =
+  const transcribe =
     "curl " +
     origin +
-    '/v1/chat/completions \\\n  -H "Authorization: Bearer <YOUR_CONSUMER_KEY>" \\\n  -H "Content-Type: application/json" \\\n  -d \'{\n    "model": "deepseek-flash",\n    "messages": [{"role": "user", "content": "Explain this Rust error"}]\n  }\''
+    '/v1/audio/transcriptions \\\n  -H "Authorization: Bearer <YOUR_CONSUMER_KEY>" \\\n  -F "file=@sample.wav" \\\n  -F "model=qwen-audio-3.0-asr-flash" \\\n  -F "language=zh"'
+  const speech =
+    "curl " +
+    origin +
+    '/v1/audio/speech \\\n  -H "Authorization: Bearer <YOUR_CONSUMER_KEY>" \\\n  -H "Content-Type: application/json" \\\n  -d \'{"input":"你好，世界","model":"qwen3-tts-flash","voice":"Cherry"}\' \\\n  --output speech.wav'
 
   return (
     <div className="flex max-w-4xl flex-col gap-5">
@@ -3300,15 +2008,22 @@ function DirectApiIntegrationPage({ locale }: { locale: Locale }) {
         </IntegrationStep>
         <IntegrationStep number={2} description={content.secondStep}>
           <CopyableCode
-            code={chat}
+            code={transcribe}
             copyLabel={copyLabel}
             copiedLabel={copiedLabel}
           />
-          <p className="text-xs text-muted-foreground">
-            {content.modelPlaceholder}: <code>deepseek-flash</code>,{" "}
-            <code>deepseek-v4-pro</code>
-          </p>
         </IntegrationStep>
+        <IntegrationStep number={3} description={content.thirdStep}>
+          <CopyableCode
+            code={speech}
+            copyLabel={copyLabel}
+            copiedLabel={copiedLabel}
+          />
+        </IntegrationStep>
+        <p className="text-xs text-muted-foreground">
+          {content.modelPlaceholder}: <code>qwen-audio-3.0-asr-flash</code>,{" "}
+          <code>qwen3-tts-flash</code>
+        </p>
       </IntegrationPanel>
       <Alert>
         <ShieldAlertIcon />
@@ -3392,79 +2107,60 @@ function CopyableCode({
   )
 }
 
-type WebSearchSource = {
-  url: string
-  title?: string
-  snippet?: string
-  published_at?: string
-}
-type WebSearchEnvelope = {
-  created: number
-  model?: string
-  queries: string[]
-  sources: WebSearchSource[]
-  truncated: boolean
-  usage: { input_tokens: number; output_tokens: number; cached_tokens: number }
+function VoicePage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
+  const t = copy[locale]
+  return (
+    <div className="flex max-w-4xl flex-col gap-5">
+      <Tabs defaultValue="transcription">
+        <TabsList aria-label={t.voiceTitle}>
+          <TabsTrigger value="transcription">{t.voiceTranscribe}</TabsTrigger>
+          <TabsTrigger value="speech">{t.voiceSynthesize}</TabsTrigger>
+        </TabsList>
+        <TabsContent value="transcription" className="pt-4">
+          <TranscriptionTool sdk={sdk} locale={locale} />
+        </TabsContent>
+        <TabsContent value="speech" className="pt-4">
+          <SpeechTool sdk={sdk} locale={locale} />
+        </TabsContent>
+      </Tabs>
+    </div>
+  )
 }
 
-/**
- * Runs the same search `/v1/web-search` runs, so an operator can verify the
- * host model, the search controls, and the upstream endpoint without a
- * Consumer credential; the call is audited and billed to the signed-in user.
- */
-function WebSearchPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
+function TranscriptionTool({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   const t = copy[locale]
-  const { data: settings } = useApiQuery<SettingsData>(sdk, "/api/settings")
-  const [query, setQuery] = useState("")
-  const [maxResults, setMaxResults] = useState(
-    String(webSearchDefaultMaxResults)
-  )
-  const [maxUses, setMaxUses] = useState(String(webSearchDefaultMaxUses))
-  const [allowedDomains, setAllowedDomains] = useState("")
-  const [blockedDomains, setBlockedDomains] = useState("")
-  const [location, setLocation] = useState<WebSearchLocation>({
-    country: "",
-    region: "",
-    city: "",
-    timezone: "",
-  })
-  const [result, setResult] = useState<WebSearchEnvelope | null>(null)
+  const settings = useApiQuery<SettingsData>(sdk, "/api/settings")
+  const [file, setFile] = useState<File | null>(null)
+  const [model, setModel] = useState("")
+  const [language, setLanguage] = useState("")
+  const [result, setResult] = useState<{
+    text: string
+    requestId?: string
+  } | null>(null)
   const [error, setError] = useState("")
   const [pending, setPending] = useState(false)
-  const sourceBound = parseWebSearchBound(maxResults, webSearchMaxResultsLimit)
-  const searchUses = parseWebSearchBound(maxUses, webSearchMaxUsesLimit)
-  const domainsConflict =
-    parseWebSearchDomains(allowedDomains).length > 0 &&
-    parseWebSearchDomains(blockedDomains).length > 0
-  const invalid =
-    sourceBound === undefined || searchUses === undefined || domainsConflict
+  const fileInput = useRef<HTMLInputElement | null>(null)
+  const models = settings.data?.transcription_models ?? []
+  useEffect(() => {
+    if (!model && settings.data) setModel(settings.data.default_transcription_model)
+  }, [model, settings.data])
+  const languageHint = normalizeLanguageHint(language)
+  const languageInvalid = !isLanguageHint(languageHint)
 
-  function setLocationField(key: keyof WebSearchLocation, value: string) {
-    setLocation((current) => ({ ...current, [key]: value }))
-  }
-
-  async function search() {
-    if (pending || !query.trim()) return
-    if (sourceBound === undefined || searchUses === undefined) return
-    if (domainsConflict) return
+  async function transcribe() {
+    if (!file || pending || languageInvalid) return
     setPending(true)
+    setError("")
     try {
-      setResult(
-        await api<WebSearchEnvelope>(sdk, "/api/web-search", {
-          method: "POST",
-          body: JSON.stringify(
-            webSearchRequestBody(
-              query,
-              sourceBound,
-              searchUses,
-              allowedDomains,
-              blockedDomains,
-              location
-            )
-          ),
-        })
+      const response = await apiFormWithHeaders<{ text: string }>(
+        sdk,
+        "/api/transcriptions",
+        transcriptionForm(file, model, language)
       )
-      setError("")
+      setResult({
+        text: response.data.text,
+        requestId: response.headers.get("x-qwen-lb-request-id") ?? undefined,
+      })
     } catch (cause) {
       setResult(null)
       setError(message(cause, t))
@@ -3474,287 +2170,316 @@ function WebSearchPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   }
 
   return (
-    <div className="grid max-w-5xl gap-5">
-      <Card>
-        <CardHeader>
-          <CardTitle>{t.webSearchQuery}</CardTitle>
-          <CardDescription className="flex flex-wrap items-center gap-2">
-            <span>{t.pageWebSearch}</span>
-            {settings && (
-              <Badge variant="secondary">
-                {t.webSearchModel}: <code>{settings.web_search_model}</code>
-              </Badge>
-            )}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-5">
-          <Field data-disabled={pending}>
-            <FieldLabel htmlFor="web-search-query">
-              {t.webSearchQuery}
+    <Card>
+      <CardHeader>
+        <CardTitle>{t.voiceTranscribeTitle}</CardTitle>
+        <CardDescription>{t.voiceTranscribeDescription}</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-5">
+        <div className="grid gap-5 sm:grid-cols-2">
+          <Field>
+            <FieldLabel htmlFor="voice-transcription-file">
+              {t.voiceAudioFile}
             </FieldLabel>
-            <Textarea
-              id="web-search-query"
-              className="min-h-24 resize-y leading-6"
-              placeholder={t.webSearchQueryPlaceholder}
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              disabled={pending}
+            <input
+              accept="audio/*"
+              className="sr-only"
+              id="voice-transcription-file"
+              onChange={(event) => {
+                setFile(event.target.files?.[0] ?? null)
+                setResult(null)
+              }}
+              ref={fileInput}
+              type="file"
             />
-          </Field>
-          <div className="grid gap-5 sm:grid-cols-2">
-            <Field
-              data-invalid={sourceBound === undefined}
-              data-disabled={pending}
-            >
-              <FieldLabel htmlFor="web-search-max-results">
-                {t.webSearchMaxResults}
-              </FieldLabel>
-              <Input
-                id="web-search-max-results"
-                type="number"
-                min={1}
-                max={webSearchMaxResultsLimit}
-                step={1}
-                value={maxResults}
-                onChange={(event) => setMaxResults(event.target.value)}
-                disabled={pending}
-                aria-invalid={sourceBound === undefined}
-                aria-describedby="web-search-max-results-help"
-                required
-              />
-              <FieldDescription id="web-search-max-results-help">
-                {sourceBound === undefined
-                  ? t.webSearchMaxResultsInvalid
-                  : t.webSearchMaxResultsHelp}
-              </FieldDescription>
-            </Field>
-            <Field data-invalid={searchUses === undefined} data-disabled={pending}>
-              <FieldLabel htmlFor="web-search-max-uses">
-                {t.webSearchMaxUses}
-              </FieldLabel>
-              <Input
-                id="web-search-max-uses"
-                type="number"
-                min={1}
-                max={webSearchMaxUsesLimit}
-                step={1}
-                value={maxUses}
-                onChange={(event) => setMaxUses(event.target.value)}
-                disabled={pending}
-                aria-invalid={searchUses === undefined}
-                aria-describedby="web-search-max-uses-help"
-                required
-              />
-              <FieldDescription id="web-search-max-uses-help">
-                {searchUses === undefined
-                  ? t.webSearchMaxUsesInvalid
-                  : t.webSearchMaxUsesHelp}
-              </FieldDescription>
-            </Field>
-          </div>
-          <div className="grid gap-5 sm:grid-cols-2">
-            <Field data-invalid={domainsConflict} data-disabled={pending}>
-              <FieldLabel htmlFor="web-search-allowed-domains">
-                {t.webSearchAllowedDomains}
-              </FieldLabel>
-              <Textarea
-                id="web-search-allowed-domains"
-                className="min-h-20 resize-y leading-6"
-                placeholder={t.webSearchDomainsPlaceholder}
-                value={allowedDomains}
-                onChange={(event) => setAllowedDomains(event.target.value)}
-                disabled={pending}
-                aria-invalid={domainsConflict}
-                aria-describedby="web-search-domains-help"
-              />
-              <FieldDescription id="web-search-domains-help">
-                {domainsConflict
-                  ? t.webSearchDomainsConflict
-                  : t.webSearchDomainsHelp}
-              </FieldDescription>
-            </Field>
-            <Field data-invalid={domainsConflict} data-disabled={pending}>
-              <FieldLabel htmlFor="web-search-blocked-domains">
-                {t.webSearchBlockedDomains}
-              </FieldLabel>
-              <Textarea
-                id="web-search-blocked-domains"
-                className="min-h-20 resize-y leading-6"
-                placeholder={t.webSearchDomainsPlaceholder}
-                value={blockedDomains}
-                onChange={(event) => setBlockedDomains(event.target.value)}
-                disabled={pending}
-                aria-invalid={domainsConflict}
-                aria-describedby="web-search-domains-help"
-              />
-            </Field>
-          </div>
-          <FieldSet>
-            <FieldLegend variant="label">{t.webSearchLocation}</FieldLegend>
-            <div className="grid gap-5 sm:grid-cols-2">
-              <Field data-disabled={pending}>
-                <FieldLabel htmlFor="web-search-country">
-                  {t.webSearchLocationCountry}
-                </FieldLabel>
-                <Input
-                  id="web-search-country"
-                  placeholder="CN"
-                  value={location.country}
-                  onChange={(event) =>
-                    setLocationField("country", event.target.value)
-                  }
-                  disabled={pending}
-                />
-              </Field>
-              <Field data-disabled={pending}>
-                <FieldLabel htmlFor="web-search-region">
-                  {t.webSearchLocationRegion}
-                </FieldLabel>
-                <Input
-                  id="web-search-region"
-                  placeholder="Shanghai"
-                  value={location.region}
-                  onChange={(event) =>
-                    setLocationField("region", event.target.value)
-                  }
-                  disabled={pending}
-                />
-              </Field>
-              <Field data-disabled={pending}>
-                <FieldLabel htmlFor="web-search-city">
-                  {t.webSearchLocationCity}
-                </FieldLabel>
-                <Input
-                  id="web-search-city"
-                  placeholder="Shanghai"
-                  value={location.city}
-                  onChange={(event) =>
-                    setLocationField("city", event.target.value)
-                  }
-                  disabled={pending}
-                />
-              </Field>
-              <Field data-disabled={pending}>
-                <FieldLabel htmlFor="web-search-timezone">
-                  {t.webSearchLocationTimezone}
-                </FieldLabel>
-                <Input
-                  id="web-search-timezone"
-                  placeholder="Asia/Shanghai"
-                  value={location.timezone}
-                  onChange={(event) =>
-                    setLocationField("timezone", event.target.value)
-                  }
-                  disabled={pending}
-                />
-              </Field>
+            <div className="flex min-w-0 items-center gap-2">
+              <Button
+                onClick={() => fileInput.current?.click()}
+                type="button"
+                variant="outline"
+              >
+                <UploadIcon data-icon="inline-start" />
+                {t.voiceChooseFile}
+              </Button>
+              <span className="min-w-0 flex-1 truncate text-sm text-muted-foreground">
+                {file
+                  ? `${file.name} · ${formatStorageBytes(file.size, locale)}`
+                  : t.voiceNoFile}
+              </span>
             </div>
-            <FieldDescription>{t.webSearchLocationHelp}</FieldDescription>
-          </FieldSet>
-        </CardContent>
-        <CardContent className="border-t pt-5">
+            <FieldDescription>{t.voiceAudioFileHelp}</FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="voice-transcription-model">
+              {t.model}
+            </FieldLabel>
+            <Select
+              value={model}
+              onValueChange={(value) => value && setModel(value)}
+            >
+              <SelectTrigger id="voice-transcription-model">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {models.map((item) => (
+                    <SelectItem key={item.model} value={item.model}>
+                      {item.model}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <FieldDescription>{t.voiceTranscribeModelHelp}</FieldDescription>
+          </Field>
+          <Field data-invalid={languageInvalid}>
+            <FieldLabel htmlFor="voice-transcription-language">
+              {t.voiceLanguage}
+            </FieldLabel>
+            <Input
+              aria-invalid={languageInvalid}
+              id="voice-transcription-language"
+              onChange={(event) => setLanguage(event.target.value)}
+              placeholder={t.voiceLanguagePlaceholder}
+              value={language}
+            />
+            <FieldDescription>
+              {languageInvalid ? t.voiceLanguageInvalid : t.voiceLanguageHelp}
+            </FieldDescription>
+          </Field>
+          <div className="flex items-end">
+            <Button
+              disabled={pending || !file || languageInvalid}
+              onClick={() => void transcribe()}
+            >
+              {pending ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <MicIcon data-icon="inline-start" />
+              )}
+              {pending ? t.voiceTranscribing : t.voiceTranscribeRun}
+            </Button>
+          </div>
+        </div>
+        {error && (
+          <Alert variant="destructive">
+            <ShieldAlertIcon />
+            <AlertTitle>{t.voiceFailed}</AlertTitle>
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+        <section className="flex flex-col gap-3 border-t pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-medium">{t.voiceTranscriptionResult}</h3>
+            {result?.requestId && (
+              <CopyableIdentifier
+                copiedLabel={t.copied}
+                copyLabel={t.copied}
+                label={t.requestId}
+                value={result.requestId}
+              />
+            )}
+          </div>
+          {result ? (
+            <>
+              <div className="max-h-80 overflow-auto rounded-md border bg-muted/50 p-3 text-sm leading-6 break-words whitespace-pre-wrap">
+                {result.text}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {t.voiceAuditHint}{" "}
+                <Link
+                  className="underline underline-offset-4"
+                  to={`/audit?model=${encodeURIComponent(model)}`}
+                >
+                  {t.voiceOpenAudit}
+                </Link>
+              </p>
+            </>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              {t.voiceTranscriptionEmpty}
+            </p>
+          )}
+        </section>
+      </CardContent>
+    </Card>
+  )
+}
+
+function SpeechTool({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
+  const t = copy[locale]
+  const settings = useApiQuery<SettingsData>(sdk, "/api/settings")
+  const [input, setInput] = useState("")
+  const [model, setModel] = useState("")
+  const [voice, setVoice] = useState(defaultSpeechVoice)
+  const [result, setResult] = useState<{
+    url: string
+    requestId?: string
+  } | null>(null)
+  const [error, setError] = useState("")
+  const [pending, setPending] = useState(false)
+  const models = settings.data?.speech_models ?? []
+  useEffect(() => {
+    if (!model && settings.data) setModel(settings.data.default_speech_model)
+  }, [model, settings.data])
+  useEffect(
+    () => () => {
+      if (result) URL.revokeObjectURL(result.url)
+    },
+    [result]
+  )
+
+  async function synthesize() {
+    if (!input.trim() || pending) return
+    setPending(true)
+    setError("")
+    try {
+      const response = await apiBlob(sdk, "/api/speech", {
+        method: "POST",
+        body: JSON.stringify(speechRequest(input, model, voice)),
+      })
+      setResult({
+        url: URL.createObjectURL(response.data),
+        requestId: response.headers.get("x-qwen-lb-request-id") ?? undefined,
+      })
+    } catch (cause) {
+      setResult(null)
+      setError(message(cause, t))
+    } finally {
+      setPending(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t.voiceSpeechTitle}</CardTitle>
+        <CardDescription>{t.voiceSpeechDescription}</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-5">
+        <Field data-disabled={pending}>
+          <FieldLabel htmlFor="voice-speech-input">{t.voiceInput}</FieldLabel>
+          <Textarea
+            className="min-h-28 resize-y leading-6"
+            disabled={pending}
+            id="voice-speech-input"
+            onChange={(event) => setInput(event.target.value)}
+            placeholder={t.voiceInputPlaceholder}
+            value={input}
+          />
+          <FieldDescription>
+            {t.voiceInputHelp} · {input.length} {t.voiceCharacters}
+          </FieldDescription>
+        </Field>
+        <div className="grid gap-5 sm:grid-cols-2">
+          <Field>
+            <FieldLabel htmlFor="voice-speech-model">{t.model}</FieldLabel>
+            <Select
+              value={model}
+              onValueChange={(value) => value && setModel(value)}
+            >
+              <SelectTrigger id="voice-speech-model">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {models.map((item) => (
+                    <SelectItem key={item.model} value={item.model}>
+                      {item.model}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <FieldDescription>{t.voiceSpeechModelHelp}</FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="voice-speech-voice">{t.voiceVoice}</FieldLabel>
+            <Input
+              id="voice-speech-voice"
+              onChange={(event) => setVoice(event.target.value)}
+              placeholder={defaultSpeechVoice}
+              value={voice}
+            />
+            <FieldDescription>{t.voiceVoiceHelp}</FieldDescription>
+          </Field>
+        </div>
+        <div>
           <Button
-            disabled={pending || invalid || !query.trim()}
-            onClick={() => void search()}
+            disabled={pending || !input.trim()}
+            onClick={() => void synthesize()}
           >
             {pending ? (
               <Spinner data-icon="inline-start" />
             ) : (
-              <SearchIcon data-icon="inline-start" />
+              <Volume2Icon data-icon="inline-start" />
             )}
-            {pending ? t.webSearching : t.webSearchRun}
+            {pending ? t.voiceSynthesizing : t.voiceSynthesizeRun}
           </Button>
-        </CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <CardTitle>{t.webSearchResultsTitle}</CardTitle>
-          <CardDescription>{t.webSearchResultsDescription}</CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-5">
-          {error ? (
-            <Alert variant="destructive">
-              <ShieldAlertIcon />
-              <AlertTitle>{t.webSearchFailed}</AlertTitle>
-              <AlertDescription>{error}</AlertDescription>
-            </Alert>
-          ) : result ? (
+        </div>
+        {error && (
+          <Alert variant="destructive">
+            <ShieldAlertIcon />
+            <AlertTitle>{t.voiceFailed}</AlertTitle>
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+        <section className="flex flex-col gap-3 border-t pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-medium">{t.voiceSpeechResult}</h3>
+            {result?.requestId && (
+              <CopyableIdentifier
+                copiedLabel={t.copied}
+                copyLabel={t.copied}
+                label={t.requestId}
+                value={result.requestId}
+              />
+            )}
+          </div>
+          {result ? (
             <>
-              <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                <Badge variant="secondary">
-                  {t.webSearchSources} {result.sources.length}
-                </Badge>
-                {result.truncated && (
-                  <Badge variant="outline">{t.webSearchTruncated}</Badge>
-                )}
-                <span>
-                  {t.webSearchUsage}: {t.webSearchInputTokens}{" "}
-                  {result.usage.input_tokens} · {t.webSearchOutputTokens}{" "}
-                  {result.usage.output_tokens} · {t.webSearchCachedTokens}{" "}
-                  {result.usage.cached_tokens}
+              <audio
+                aria-label={t.voiceSpeechResult}
+                className="w-full"
+                controls
+                src={result.url}
+              />
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  onClick={() => {
+                    const anchor = document.createElement("a")
+                    anchor.download = "speech.wav"
+                    anchor.href = result.url
+                    anchor.click()
+                  }}
+                  type="button"
+                  variant="outline"
+                >
+                  <DownloadIcon data-icon="inline-start" />
+                  {t.voiceDownload}
+                </Button>
+                <span className="text-xs text-muted-foreground">
+                  {t.voiceWavNote}
                 </span>
               </div>
-              {result.queries.length > 0 && (
-                <div className="grid gap-2">
-                  <div className="text-sm font-medium">
-                    {t.webSearchQueries}
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    {result.queries.map((item) => (
-                      <Badge key={item} variant="secondary">
-                        {item}
-                      </Badge>
-                    ))}
-                  </div>
-                </div>
-              )}
-              <ul className="flex flex-col divide-y">
-                {result.sources.map((source) => (
-                  <li
-                    className="flex min-w-0 flex-col gap-1 py-3"
-                    key={source.url}
-                  >
-                    <a
-                      className="w-fit text-sm font-medium text-pretty underline-offset-4 hover:underline"
-                      href={source.url}
-                      rel="noreferrer"
-                      target="_blank"
-                    >
-                      {source.title || source.url}
-                      <ExternalLinkIcon className="ml-1 inline size-3.5 align-[-2px]" />
-                    </a>
-                    <span className="truncate text-xs text-muted-foreground">
-                      {source.url}
-                      {source.published_at ? ` · ${source.published_at}` : ""}
-                    </span>
-                    {source.snippet && (
-                      <p className="text-sm text-muted-foreground text-pretty">
-                        {source.snippet}
-                      </p>
-                    )}
-                  </li>
-                ))}
-              </ul>
               <p className="text-xs text-muted-foreground">
-                {t.webSearchCostNote}{" "}
-                {settings && (
-                  <Link
-                    className="underline underline-offset-4"
-                    to={`/audit?model=${encodeURIComponent(settings.web_search_model)}`}
-                  >
-                    {t.webSearchAuditLink}
-                  </Link>
-                )}
+                {t.voiceAuditHint}{" "}
+                <Link
+                  className="underline underline-offset-4"
+                  to={`/audit?model=${encodeURIComponent(model)}`}
+                >
+                  {t.voiceOpenAudit}
+                </Link>
               </p>
             </>
           ) : (
-            <div className="flex min-h-40 items-center justify-center rounded-lg border border-dashed px-6 text-center text-sm text-muted-foreground">
-              {t.webSearchEmpty}
-            </div>
+            <p className="text-sm text-muted-foreground">
+              {t.voiceSpeechEmpty}
+            </p>
           )}
-        </CardContent>
-      </Card>
-    </div>
+        </section>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -3766,100 +2491,27 @@ function Dashboard({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   )
   if (loading) return <LoadingTable />
   if (error) return <ErrorState message={error} />
-  const rows = [
-    [t.activeConsumers, data?.active_consumers],
-    [t.activeProviders, data?.active_providers],
-    [t.calls24h, data?.calls_24h],
-    [t.peakCalls24h, data?.peak_calls_24h],
-    [t.errors24h, data?.errors_24h],
-    [t.officialCost24h, formatUsd(data?.official_cost_usd_nanos_24h, locale)],
-    [t.actualCost24h, formatUsd(data?.actual_cost_usd_nanos_24h, locale)],
-    [
-      t.officialConsumedUsd,
-      formatUsd(data?.official_consumed_usd_nanos, locale),
-    ],
-    [t.actualConsumedUsd, formatUsd(data?.consumed_usd_nanos, locale)],
-  ]
-  const tokenRows = [
-    [t.inputTokens, Number(data?.input_tokens_24h ?? 0).toLocaleString(locale)],
-    [
-      t.outputTokens,
-      Number(data?.output_tokens_24h ?? 0).toLocaleString(locale),
-    ],
-    [
-      t.cachedInputTokens,
-      Number(data?.cached_tokens_24h ?? 0).toLocaleString(locale),
-    ],
-    [
-      t.cacheRate,
-      cacheHitRate(
-        data?.cached_tokens_24h ?? 0,
-        data?.input_tokens_24h ?? 0,
-        locale
-      ),
-    ],
-    [
-      t.inputOutputRatio,
-      inputOutputRatio(
-        data?.input_tokens_24h ?? 0,
-        data?.output_tokens_24h ?? 0,
-        locale
-      ),
-    ],
+  const metrics: Array<[string, string]> = [
+    [t.activeConsumers, (data?.active_consumers ?? 0).toLocaleString(locale)],
+    [t.activeProviders, (data?.active_providers ?? 0).toLocaleString(locale)],
+    [t.calls24h, (data?.calls_24h ?? 0).toLocaleString(locale)],
+    [t.errors24h, (data?.errors_24h ?? 0).toLocaleString(locale)],
+    [t.audioSeconds24h, formatSeconds(data?.audio_seconds_24h ?? 0, locale)],
+    [t.characters24h, (data?.characters_24h ?? 0).toLocaleString(locale)],
+    [t.cost24h, formatUsd(data?.cost_usd_nanos_24h, locale)],
+    [t.consumedUsd, formatUsd(data?.consumed_usd_nanos, locale)],
   ]
   return (
     <div className="flex flex-col gap-5">
-      <Card>
-        <CardHeader className="flex-row items-start justify-between">
-          <div>
-            <CardTitle>{t.pricingTariffTitle}</CardTitle>
-            <CardDescription>{t.pricingTariffDescription}</CardDescription>
-          </div>
-          <Badge variant={data?.peak_now ? "destructive" : "secondary"}>
-            {data?.peak_now ? t.pricingPeak : t.pricingOffPeak}
-          </Badge>
-        </CardHeader>
-        <CardContent className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
-          <span>{t.pricingModels}:</span>
-          {(data?.available_model_ids ?? []).map((model) => (
-            <Badge key={model} variant="outline">
-              {model}
-            </Badge>
-          ))}
-        </CardContent>
-      </Card>
       <Card>
         <CardHeader>
           <CardTitle>{t.accountOverview}</CardTitle>
           <CardDescription>{t.accountOverviewDescription}</CardDescription>
         </CardHeader>
-        <CardContent className="flex flex-col gap-4">
+        <CardContent>
           <dl className="grid gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-2 lg:grid-cols-4">
-            {rows.map(([label, value]) => (
-              <div
-                key={String(label)}
-                className="flex flex-col gap-1 bg-background p-4"
-              >
-                <dt>{label}</dt>
-                <dd className="text-2xl font-semibold tabular-nums">
-                  {value ?? 0}
-                </dd>
-              </div>
-            ))}
-          </dl>
-          <Separator />
-          <div className="flex flex-col gap-1">
-            <h3 className="text-sm font-medium">{t.tokenUsage24h}</h3>
-            <p className="text-sm text-muted-foreground">
-              {t.tokenUsage24hDescription}
-            </p>
-          </div>
-          <dl className="grid gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-2 lg:grid-cols-5">
-            {tokenRows.map(([label, value]) => (
-              <div
-                key={String(label)}
-                className="flex flex-col gap-1 bg-background p-4"
-              >
+            {metrics.map(([label, value]) => (
+              <div key={label} className="flex flex-col gap-1 bg-background p-4">
                 <dt>{label}</dt>
                 <dd className="text-2xl font-semibold tabular-nums">{value}</dd>
               </div>
@@ -3867,105 +2519,87 @@ function Dashboard({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           </dl>
         </CardContent>
       </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>{t.pricingModels}</CardTitle>
+          <CardDescription>{t.dashboardModelsDescription}</CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+            <span>{t.transcriptionModels}:</span>
+            {(data?.transcription_model_ids ?? []).map((model) => (
+              <Badge key={model} variant="outline">
+                {model}
+              </Badge>
+            ))}
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+            <span>{t.speechModels}:</span>
+            {(data?.speech_model_ids ?? []).map((model) => (
+              <Badge key={model} variant="outline">
+                {model}
+              </Badge>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
     </div>
   )
 }
 
-function ModelPricesPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
+function VoicePricesPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   const t = copy[locale]
-  const query = useApiQuery<ModelPricesResponse>(sdk, "/api/model-prices")
+  const query = useApiQuery<AudioPricesResponse>(sdk, "/api/audio-prices")
   if (query.loading) return <LoadingTable />
   if (query.error) return <ErrorState message={query.error} />
   if (!query.data) return <ErrorState message={t.unknownError} />
-  const missingRate = "—"
-  const rate = (value: number | undefined) =>
-    typeof value === "number" ? formatUsd(value, locale) : missingRate
+  const data = query.data
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <Card>
         <CardHeader>
-          <CardTitle>{t.modelPricesTitle}</CardTitle>
-          <CardDescription>{t.modelPricesDescription}</CardDescription>
+          <CardTitle>{t.voicePricesTitle}</CardTitle>
+          <CardDescription>{t.voicePricesDescription}</CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-muted-foreground">
           <span>
-            {t.pricingUnit}: {query.data.unit}
-          </span>
-          <span>
-            {t.pricingAsOf}: {query.data.source_as_of}
+            {t.pricingUnit}: {data.unit}
           </span>
           <a
             className="inline-flex items-center gap-1 font-medium text-foreground underline underline-offset-4"
-            href={query.data.source_url}
+            href={t.voicePricingSourceUrl}
             rel="noreferrer"
             target="_blank"
           >
-            {t.officialPricingSource}
+            {t.voicePricingSource}
             <ExternalLinkIcon aria-hidden="true" className="size-3.5" />
           </a>
         </CardContent>
       </Card>
       <Card>
         <CardHeader>
-          <CardTitle>{t.officialModelPriceTable}</CardTitle>
-          <CardDescription>{t.modelPricesTableDescription}</CardDescription>
+          <CardTitle>{t.transcriptionModels}</CardTitle>
+          <CardDescription>{t.transcriptionModelsDescription}</CardDescription>
         </CardHeader>
         <CardContent>
           <DataTable>
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead rowSpan={2}>{t.model}</TableHead>
-                  <TableHead className="text-center" colSpan={3}>
-                    {t.pricingPeak}
+                  <TableHead>{t.model}</TableHead>
+                  <TableHead className="text-right">
+                    {t.voiceModelRate}
                   </TableHead>
-                  <TableHead className="text-center" colSpan={3}>
-                    {t.pricingOffPeak}
-                  </TableHead>
-                </TableRow>
-                <TableRow>
-                  {[t.cacheHitTokens, t.cacheMissTokens, t.output].map(
-                    (label) => (
-                      <TableHead className="text-right" key={`peak-${label}`}>
-                        {label}
-                      </TableHead>
-                    )
-                  )}
-                  {[t.cacheHitTokens, t.cacheMissTokens, t.output].map(
-                    (label) => (
-                      <TableHead
-                        className="text-right"
-                        key={`off-peak-${label}`}
-                      >
-                        {label}
-                      </TableHead>
-                    )
-                  )}
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {query.data.rows.map((price) => (
-                  <TableRow key={price.model}>
+                {data.transcription.map((row) => (
+                  <TableRow key={row.model}>
                     <TableCell>
-                      <code>{price.model}</code>
+                      <code>{row.model}</code>
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
-                      {rate(price.peak.cache_hit_usd_nanos)}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">
-                      {rate(price.peak.cache_miss_usd_nanos)}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">
-                      {rate(price.peak.output_usd_nanos)}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">
-                      {rate(price.off_peak.cache_hit_usd_nanos)}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">
-                      {rate(price.off_peak.cache_miss_usd_nanos)}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">
-                      {rate(price.off_peak.output_usd_nanos)}
+                      {row.price_usd_per_second} USD / {t.voiceSecondUnit}
                     </TableCell>
                   </TableRow>
                 ))}
@@ -3974,6 +2608,48 @@ function ModelPricesPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           </DataTable>
         </CardContent>
       </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>{t.speechModels}</CardTitle>
+          <CardDescription>{t.speechModelsDescription}</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <DataTable>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{t.model}</TableHead>
+                  <TableHead className="text-right">
+                    {t.voiceModelRate}
+                  </TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {data.speech.map((row) => (
+                  <TableRow key={row.model}>
+                    <TableCell>
+                      <code>{row.model}</code>
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {row.price_usd_per_character} USD /{" "}
+                      {t.voiceCharacterUnit}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </DataTable>
+        </CardContent>
+      </Card>
+      <Alert>
+        <AlertDescription>{t.voicePricesBilling}</AlertDescription>
+      </Alert>
+      <p className="text-xs text-muted-foreground">
+        {t.voicePricesEditable}{" "}
+        <Link className="underline underline-offset-4" to="/settings">
+          {t.settings}
+        </Link>
+      </p>
     </div>
   )
 }
@@ -4324,13 +3000,6 @@ function SystemResourcesLoading({ locale }: { locale: Locale }) {
   )
 }
 
-type ProviderBalanceState = {
-  provider: Provider
-  status: "loading" | "success" | "error"
-  balance?: ProviderBalance
-  error?: string
-}
-
 function Providers({
   sdk,
   locale,
@@ -4351,9 +3020,6 @@ function Providers({
   const [editingProviderName, setEditingProviderName] = useState("")
   const [editingProviderPending, setEditingProviderPending] = useState(false)
   const [testState, setTestState] = useState<ProviderTestState | null>(null)
-  const [balanceState, setBalanceState] = useState<ProviderBalanceState | null>(
-    null
-  )
   const [deleteTarget, setDeleteTarget] = useState<Provider | null>(null)
   const [deletePending, setDeletePending] = useState(false)
   const [togglePending, setTogglePending] = useState<string | null>(null)
@@ -4380,44 +3046,21 @@ function Providers({
     testRequest.current = controller
     setTestState({ provider, status: "loading" })
     try {
-      const result = await api<{
-        ok: boolean
-        status?: number | null
-        latency_ms?: number
-        model?: string
-        error?: string | null
-      }>(sdk, `/api/providers/${provider.id}/test`, {
-        method: "POST",
-        signal: controller.signal,
-      })
+      const result = await api<ProviderTestResult>(
+        sdk,
+        `/api/providers/${provider.id}/test`,
+        { method: "POST", signal: controller.signal }
+      )
       setTestState({
         provider,
         status: result.ok ? "success" : "error",
-        latency_ms: result.latency_ms,
-        model: result.model,
+        result,
         error: result.error ?? (result.ok ? undefined : t.providerTestFailed),
       })
       refreshProviders()
     } catch (cause) {
       if (isAbortError(cause)) return
       setTestState({ provider, status: "error", error: message(cause, t) })
-    }
-  }
-
-  async function loadBalance(provider: Provider) {
-    setBalanceState({ provider, status: "loading" })
-    try {
-      const balance = await api<ProviderBalance>(
-        sdk,
-        `/api/providers/${provider.id}/balance`
-      )
-      setBalanceState({ provider, status: "success", balance })
-    } catch (cause) {
-      setBalanceState({
-        provider,
-        status: "error",
-        error: message(cause, t),
-      })
     }
   }
 
@@ -4669,25 +3312,21 @@ function Providers({
                                 {usage.errors.toLocaleString(locale)})
                               </span>
                               <span className="flex flex-wrap gap-x-4 gap-y-1">
-                                <TokenMetric
-                                  label={t.input}
-                                  value={usage.input_tokens}
-                                  locale={locale}
+                                <MetricValue
+                                  label={t.audioSeconds}
+                                  value={formatSeconds(
+                                    usage.audio_seconds,
+                                    locale
+                                  )}
                                 />
-                                <TokenMetric
-                                  label={t.output}
-                                  value={usage.output_tokens}
-                                  locale={locale}
-                                />
-                                <TokenMetric
-                                  label={t.cacheHitTokens}
-                                  value={usage.cached_tokens}
-                                  locale={locale}
+                                <MetricValue
+                                  label={t.characters}
+                                  value={usage.characters.toLocaleString(locale)}
                                 />
                               </span>
                               <span className="text-muted-foreground">
                                 {t.providerUsageCost}:{" "}
-                                {formatUsd(usage.actual_cost_usd_nanos, locale)}
+                                {formatUsd(usage.cost_usd_nanos, locale)}
                               </span>
                             </div>
                           ) : (
@@ -4707,13 +3346,6 @@ function Providers({
                               onClick={() => void testProvider(provider)}
                             >
                               {t.testProvider}
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              onClick={() => void loadBalance(provider)}
-                            >
-                              {t.providerBalance}
                             </Button>
                             {isAdministrator ? (
                               <Button
@@ -4754,11 +3386,6 @@ function Providers({
         locale={locale}
         state={testState}
         onClose={() => setTestState(null)}
-      />
-      <ProviderBalanceDialog
-        locale={locale}
-        state={balanceState}
-        onClose={() => setBalanceState(null)}
       />
       <ProviderKeyDialog
         sdk={sdk}
@@ -4829,7 +3456,7 @@ function ProviderDialog({
   async function submit(event: FormEvent) {
     event.preventDefault()
     if (pending) return
-    if (!isConsumerToken(apiKey)) {
+    if (!isConsumerSecret(apiKey)) {
       toast.error(t.providerApiKeyInvalid)
       return
     }
@@ -5058,64 +3685,19 @@ function ProviderTestDialog({
           <Definition
             rows={[
               [t.providerTestResult, t.providerTestSucceeded],
-              [t.providerTestModel, state?.model || "—"],
-              [t.providerTestLatency, formatLatency(state?.latency_ms)],
-            ]}
-          />
-        )}
-        <DialogFooter>
-          <Button onClick={onClose}>{t.close}</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function ProviderBalanceDialog({
-  locale,
-  state,
-  onClose,
-}: {
-  locale: Locale
-  state: ProviderBalanceState | null
-  onClose: () => void
-}) {
-  const t = copy[locale]
-  const balances = state?.balance?.balance_infos ?? []
-  return (
-    <Dialog open={Boolean(state)} onOpenChange={(next) => !next && onClose()}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>
-            {t.providerBalanceTitle}: {state?.provider.name}
-          </DialogTitle>
-          <DialogDescription>{t.providerBalanceDescription}</DialogDescription>
-        </DialogHeader>
-        {state?.status === "loading" ? (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Spinner />
-            {t.loading}
-          </div>
-        ) : state?.status === "error" ? (
-          <ErrorState message={state.error || t.unknownError} />
-        ) : balances.length === 0 ? (
-          <Alert>
-            <AlertTitle>{t.providerBalanceUnavailable}</AlertTitle>
-          </Alert>
-        ) : (
-          <Definition
-            rows={[
+              [t.providerTestHttpStatus, state?.result?.status ?? "—"],
+              [t.providerTestModelCount, state?.result?.model_count ?? "—"],
               [
-                t.providerBalanceAvailable,
-                state?.balance?.is_available ? t.yes : t.no,
+                t.providerTestTranscriptionModel,
+                state?.result?.has_default_transcription_model
+                  ? t.yes
+                  : t.no,
               ],
-              ...balances.map(
-                (info) =>
-                  [
-                    info.currency || t.providerBalance,
-                    info.total_balance ?? "—",
-                  ] as [string, unknown]
-              ),
+              [
+                t.providerTestSpeechModel,
+                state?.result?.has_default_speech_model ? t.yes : t.no,
+              ],
+              [t.providerTestLatency, formatLatency(state?.result?.latency_ms)],
             ]}
           />
         )}
@@ -5604,7 +4186,7 @@ function UsagePage({
   const [columnDimensions, setColumnDimensions] = useState<PivotDimension[]>([
     "date",
   ])
-  const [dataFields, setDataFields] = useState<UsageMetric[]>(["input_tokens"])
+  const [dataFields, setDataFields] = useState<UsageMetric[]>(["audio_seconds"])
   const [sorting, setSorting] = useState<SortingState>([])
   const { data, error, loading } = useApiQuery<UsageResponse>(
     sdk,
@@ -5680,10 +4262,11 @@ function UsagePage({
           header: usageAggregateLabel(field, t),
           cell: (info) => (
             <span className="block text-right tabular-nums">
-              {field === "official_cost_usd_nanos" ||
-              field === "actual_cost_usd_nanos"
+              {field === "cost_usd_nanos"
                 ? formatUsd(Number(info.getValue()), locale)
-                : Number(info.getValue()).toLocaleString(locale)}
+                : field === "audio_seconds"
+                  ? formatSeconds(Number(info.getValue()), locale)
+                  : Number(info.getValue()).toLocaleString(locale)}
             </span>
           ),
         })),
@@ -6263,15 +4846,7 @@ function AuditPage({
                       <TableHead>{t.consumer}</TableHead>
                       <TableHead>{t.time}</TableHead>
                       <TableHead>{t.model}</TableHead>
-                      <TableHead className="text-right">
-                        {t.actualCost}
-                      </TableHead>
-                      <TableHead className="text-right">
-                        {t.officialCost}
-                      </TableHead>
-                      <TableHead className="text-right">
-                        {t.priceMultiplier}
-                      </TableHead>
+                      <TableHead className="text-right">{t.cost}</TableHead>
                       <TableHead>{t.provider}</TableHead>
                       <TableHead>{t.threadId}</TableHead>
                       <TableHead>{t.status}</TableHead>
@@ -6292,30 +4867,12 @@ function AuditPage({
                           {formatTime(row.created_at, locale)}
                         </TableCell>
                         <TableCell>
-                          <div className="flex min-w-52 flex-col gap-1">
-                            <code>{row.model || "—"}</code>
-                            <div className="flex flex-wrap gap-1">
-                              <Badge
-                                variant={row.peak ? "destructive" : "secondary"}
-                              >
-                                {row.peak ? t.pricingPeak : t.pricingOffPeak}
-                              </Badge>
-                              {row.reasoning_effort && (
-                                <Badge variant="outline">
-                                  {t.reasoningEffort} · {row.reasoning_effort}
-                                </Badge>
-                              )}
-                            </div>
-                          </div>
+                          <code className="whitespace-nowrap">
+                            {row.model || "—"}
+                          </code>
                         </TableCell>
                         <TableCell className="text-right tabular-nums">
-                          {formatUsd(row.actual_cost_usd_nanos, locale)}
-                        </TableCell>
-                        <TableCell className="text-right tabular-nums">
-                          {formatUsd(row.official_cost_usd_nanos, locale)}
-                        </TableCell>
-                        <TableCell className="text-right tabular-nums">
-                          {formatMultiplier(row.price_multiplier_nanos, locale)}
+                          {formatUsd(row.cost_usd_nanos, locale)}
                         </TableCell>
                         <TableCell title={row.provider_id}>
                           {row.provider_name || "—"}
@@ -6380,33 +4937,15 @@ function AuditPage({
                           <div className="flex items-center gap-3 text-xs tabular-nums">
                             <div className="flex flex-col gap-0.5">
                               <span className="text-muted-foreground">
-                                {t.input}
+                                {t.audioSeconds}
                               </span>
-                              <span>{row.input_tokens.toLocaleString()}</span>
+                              <span>{formatSeconds(row.audio_seconds, locale)}</span>
                             </div>
                             <div className="flex flex-col gap-0.5">
                               <span className="text-muted-foreground">
-                                {t.cachedInput}
+                                {t.characters}
                               </span>
-                              <span>{row.cached_tokens.toLocaleString()}</span>
-                            </div>
-                            <div className="flex flex-col gap-0.5">
-                              <span className="text-muted-foreground">
-                                {t.cacheHitRate}
-                              </span>
-                              <span>
-                                {cacheHitRate(
-                                  row.cached_tokens,
-                                  row.input_tokens,
-                                  locale
-                                )}
-                              </span>
-                            </div>
-                            <div className="flex flex-col gap-0.5">
-                              <span className="text-muted-foreground">
-                                {t.output}
-                              </span>
-                              <span>{row.output_tokens.toLocaleString()}</span>
+                              <span>{row.characters.toLocaleString(locale)}</span>
                             </div>
                             <div className="flex flex-col gap-0.5">
                               <span className="text-muted-foreground">
@@ -6615,26 +5154,15 @@ function RequestDetailPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           <AlertDescription>{t.auditBodiesDeletedDescription}</AlertDescription>
         </Alert>
       )}
-      {data.path === "/v1/responses" && data.bodies_available && (
-        <>
-          <FinalResponse
-            responseBody={data.response_body}
-            truncated={data.response_body_truncated}
-            labels={t}
-          />
-          <ResponsesAPIRequestBodyRenderer
-            request={data.request_body}
-            locale={locale}
-            truncated={data.request_body_truncated}
-          />
-        </>
+      {data.path === "/v1/audio/transcriptions" && data.bodies_available && (
+        <TranscriptionResult
+          responseBody={data.response_body}
+          truncated={data.response_body_truncated}
+          labels={t}
+        />
       )}
       {data.bodies_available && (
-        <DiagnosticBodies
-          data={data}
-          labels={t}
-          showRequestBody={data.path !== "/v1/responses"}
-        />
+        <DiagnosticBodies data={data} labels={t} showRequestBody={true} />
       )}
       <AlertDialog
         open={deleteBodiesOpen}
@@ -6698,11 +5226,6 @@ function RequestSummary({
             [labels.userId, data.user_id],
             [labels.provider, data.provider_name || data.provider_id || "—"],
             [labels.model, data.model || "—"],
-            [
-              labels.pricingTariff,
-              data.peak ? labels.pricingPeak : labels.pricingOffPeak,
-            ],
-            [labels.reasoningEffort, data.reasoning_effort || "—"],
             [labels.upstreamHttpProtocol, data.upstream_http_version || "—"],
             [labels.httpStatusCode, data.status],
             [
@@ -6752,62 +5275,27 @@ function RequestSummary({
           ]}
         />
         <section className="flex flex-col gap-3">
-          <h3 className="text-sm font-medium">{labels.tokenUsage}</h3>
+          <h3 className="text-sm font-medium">{labels.usageCost}</h3>
           <Definition
             rows={[
-              [labels.inputTokens, data.input_tokens.toLocaleString(locale)],
+              [labels.audioSeconds, formatSeconds(data.audio_seconds, locale)],
+              [labels.characters, data.characters.toLocaleString(locale)],
+              [labels.cost, formatUsd(data.cost_usd_nanos, locale)],
               [
-                labels.cachedInputTokens,
-                data.cached_tokens.toLocaleString(locale),
-              ],
-              [labels.outputTokens, data.output_tokens.toLocaleString(locale)],
-              [
-                labels.officialCost,
-                formatUsd(data.official_cost_usd_nanos, locale),
+                labels.consumedUsdBefore,
+                formatUsd(data.consumed_usd_before_nanos, locale),
               ],
               [
-                labels.priceMultiplier,
-                formatMultiplier(data.price_multiplier_nanos, locale),
+                labels.consumedUsdAfter,
+                formatUsd(data.consumed_usd_after_nanos, locale),
               ],
               [
-                labels.actualCost,
-                formatUsd(data.actual_cost_usd_nanos, locale),
+                labels.providedUsdBefore,
+                formatUsd(data.provided_usd_before_nanos, locale),
               ],
               [
-                labels.officialConsumedUsdBefore,
-                formatUsd(data.official_consumed_usd_before_nanos, locale),
-              ],
-              [
-                labels.officialConsumedUsdAfter,
-                formatUsd(data.official_consumed_usd_after_nanos, locale),
-              ],
-              [
-                labels.actualConsumedUsdBefore,
-                formatUsd(data.actual_consumed_usd_before_nanos, locale),
-              ],
-              [
-                labels.actualConsumedUsdAfter,
-                formatUsd(data.actual_consumed_usd_after_nanos, locale),
-              ],
-              [
-                labels.officialProvidedUsdBefore,
-                formatUsd(data.official_provided_usd_before_nanos, locale),
-              ],
-              [
-                labels.officialProvidedUsdAfter,
-                formatUsd(data.official_provided_usd_after_nanos, locale),
-              ],
-              [
-                labels.actualProvidedUsdBefore,
-                formatUsd(data.actual_provided_usd_before_nanos, locale),
-              ],
-              [
-                labels.actualProvidedUsdAfter,
-                formatUsd(data.actual_provided_usd_after_nanos, locale),
-              ],
-              [
-                labels.cacheHitRate,
-                cacheHitRate(data.cached_tokens, data.input_tokens, locale),
+                labels.providedUsdAfter,
+                formatUsd(data.provided_usd_after_nanos, locale),
               ],
             ]}
           />
@@ -6874,7 +5362,7 @@ function DiagnosticBodies({
   )
 }
 
-function FinalResponse({
+function TranscriptionResult({
   responseBody,
   truncated,
   labels,
@@ -6883,7 +5371,7 @@ function FinalResponse({
   truncated: boolean
   labels: (typeof copy)[Locale]
 }) {
-  const output = responseOutputText(responseBody)
+  const text = transcriptionText(responseBody)
   return (
     <Card>
       <CardHeader>
@@ -6893,9 +5381,9 @@ function FinalResponse({
         )}
       </CardHeader>
       <CardContent>
-        {output ? (
+        {text ? (
           <div className="max-h-80 overflow-auto rounded-md border bg-muted p-3 text-sm leading-6 break-words whitespace-pre-wrap">
-            {output}
+            {text}
           </div>
         ) : (
           <p className="text-sm text-muted-foreground">
@@ -7311,28 +5799,45 @@ function SettingsPage({
               [t.upstream, data.upstream_base],
               [t.bodyLimit, `${data.response_body_limit} bytes`],
               [t.affinityTtl, `${data.affinity_ttl_seconds} s`],
-              [t.pricingModels, data.available_model_ids.join(", ") || "—"],
+              [
+                t.transcriptionModels,
+                data.transcription_models.map((item) => item.model).join(", ") ||
+                  "—",
+              ],
+              [
+                t.speechModels,
+                data.speech_models.map((item) => item.model).join(", ") || "—",
+              ],
             ]}
           />
         </CardContent>
       </Card>
       {(user.role === "root" || user.role === "admin") && (
         <>
-          <WebSearchSettings
-            sdk={sdk}
-            locale={locale}
-            initial={data.web_search_model}
-            upstreamBase={data.upstream_base}
-          />
           <ProviderConcurrencySettings
             sdk={sdk}
             locale={locale}
             initial={data.provider_concurrency_limit}
           />
-          <AvailableModelsSettings
+          <VoiceModelsSettings
             sdk={sdk}
             locale={locale}
-            initial={data.available_model_ids}
+            kind="transcription"
+            rows={data.transcription_models.map((item) => ({
+              model: item.model,
+              rate: item.price_usd_per_second,
+            }))}
+            defaultModel={data.default_transcription_model}
+          />
+          <VoiceModelsSettings
+            sdk={sdk}
+            locale={locale}
+            kind="speech"
+            rows={data.speech_models.map((item) => ({
+              model: item.model,
+              rate: item.price_usd_per_character,
+            }))}
+            defaultModel={data.default_speech_model}
           />
         </>
       )}
@@ -7343,85 +5848,6 @@ function SettingsPage({
         </>
       )}
     </div>
-  )
-}
-
-function WebSearchSettings({
-  sdk,
-  locale,
-  initial,
-  upstreamBase,
-}: {
-  sdk: AuthSdk
-  locale: Locale
-  initial: string
-  upstreamBase: string
-}) {
-  const t = copy[locale]
-  const queryClient = useQueryClient()
-  const [value, setValue] = useState(initial)
-  const [pending, setPending] = useState(false)
-  const model = value.trim()
-  const invalid = model.length === 0 || model.length > 200
-  useEffect(() => setValue(initial), [initial])
-
-  async function save(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    if (invalid || pending) return
-    setPending(true)
-    try {
-      await api(sdk, "/api/settings/web-search", {
-        method: "PATCH",
-        body: JSON.stringify({ web_search_model: model }),
-      })
-      await queryClient.invalidateQueries({ queryKey: ["/api/settings"] })
-      toast.success(t.settingsSaved)
-    } catch (cause) {
-      toast.error(message(cause, t))
-    } finally {
-      setPending(false)
-    }
-  }
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{t.webSearchSettingsTitle}</CardTitle>
-        <CardDescription>{t.webSearchSettingsDescription}</CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-4">
-        <Definition
-          rows={[
-            [t.webSearchEndpoint, `${upstreamBase}/anthropic/v1/messages`],
-          ]}
-        />
-        <form onSubmit={save}>
-          <FieldGroup>
-            <Field data-invalid={invalid} data-disabled={pending}>
-              <FieldLabel htmlFor="settings-web-search-model">
-                {t.webSearchModelLabel}
-              </FieldLabel>
-              <Input
-                id="settings-web-search-model"
-                value={value}
-                onChange={(event) => setValue(event.target.value)}
-                disabled={pending}
-                aria-invalid={invalid}
-                aria-describedby="settings-web-search-model-help"
-                required
-              />
-              <FieldDescription id="settings-web-search-model-help">
-                {invalid ? t.webSearchModelInvalid : t.webSearchModelHelp}
-              </FieldDescription>
-            </Field>
-            <Button type="submit" disabled={pending || invalid}>
-              {pending && <Spinner data-icon="inline-start" />}
-              {t.saveSettings}
-            </Button>
-          </FieldGroup>
-        </form>
-      </CardContent>
-    </Card>
   )
 }
 
@@ -7505,35 +5931,83 @@ function ProviderConcurrencySettings({
   )
 }
 
-function AvailableModelsSettings({
+type VoiceModelDraft = { model: string; rate: string }
+
+function VoiceModelsSettings({
   sdk,
   locale,
-  initial,
+  kind,
+  rows,
+  defaultModel,
 }: {
   sdk: AuthSdk
   locale: Locale
-  initial: string[]
+  kind: "transcription" | "speech"
+  rows: VoiceModelDraft[]
+  defaultModel: string
 }) {
   const t = copy[locale]
-  const [value, setValue] = useState(initial.join("\n"))
+  const queryClient = useQueryClient()
+  const [models, setModels] = useState(rows)
+  const [defaultValue, setDefaultValue] = useState(defaultModel)
   const [pending, setPending] = useState(false)
+  useEffect(() => {
+    setModels(rows)
+    setDefaultValue(defaultModel)
+  }, [rows, defaultModel])
 
-  useEffect(() => setValue(initial.join("\n")), [initial])
+  const title =
+    kind === "transcription" ? t.transcriptionModels : t.speechModels
+  const description =
+    kind === "transcription"
+      ? t.transcriptionModelsDescription
+      : t.speechModelsDescription
+  const unit =
+    kind === "transcription" ? t.transcriptionModelsUnit : t.speechModelsUnit
+  const priceValid = (value: string) =>
+    /^\d+(?:\.\d{1,9})?$/u.test(value.trim()) && Number(value) > 0
+  const modelValid = (value: string) =>
+    /^[A-Za-z0-9._:-]{1,128}$/u.test(value.trim())
+  const rowsValid =
+    models.length > 0 &&
+    models.every((row) => modelValid(row.model) && priceValid(row.rate))
+  const defaultValid = models.some(
+    (row) => row.model.trim() === defaultValue
+  )
+
+  function updateRow(index: number, patch: Partial<VoiceModelDraft>) {
+    setModels((current) =>
+      current.map((row, position) =>
+        position === index ? { ...row, ...patch } : row
+      )
+    )
+  }
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    const available_model_ids = value.split(/[\s,]+/).filter(Boolean)
-    if (available_model_ids.length === 0) {
-      toast.error(t.availableModelsRequired)
-      return
-    }
+    if (!rowsValid || !defaultValid || pending) return
     setPending(true)
     try {
-      await api(sdk, "/api/settings/available-models", {
-        method: "PATCH",
-        body: JSON.stringify({ available_model_ids }),
-      })
-      toast.success(t.availableModelsSaved)
+      await api(
+        sdk,
+        kind === "transcription"
+          ? "/api/settings/transcription-models"
+          : "/api/settings/speech-models",
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            models: models.map((row) => ({
+              model: row.model.trim(),
+              ...(kind === "transcription"
+                ? { price_usd_per_second: row.rate.trim() }
+                : { price_usd_per_character: row.rate.trim() }),
+            })),
+            default_model: defaultValue,
+          }),
+        }
+      )
+      await queryClient.invalidateQueries({ queryKey: ["/api/settings"] })
+      toast.success(t.settingsSaved)
     } catch (cause) {
       toast.error(message(cause, t))
     } finally {
@@ -7544,27 +6018,119 @@ function AvailableModelsSettings({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>{t.availableModels}</CardTitle>
-        <CardDescription>{t.availableModelsDescription}</CardDescription>
+        <CardTitle>{title}</CardTitle>
+        <CardDescription>{description}</CardDescription>
       </CardHeader>
       <CardContent>
         <form onSubmit={save}>
           <FieldGroup>
+            {models.map((row, index) => (
+              <div
+                className="flex flex-col gap-3 sm:flex-row sm:items-end"
+                key={index}
+              >
+                <Field
+                  className="min-w-0 flex-1"
+                  data-invalid={!modelValid(row.model)}
+                >
+                  <FieldLabel htmlFor={`settings-${kind}-model-${index}`}>
+                    {t.model}
+                  </FieldLabel>
+                  <Input
+                    id={`settings-${kind}-model-${index}`}
+                    value={row.model}
+                    spellCheck={false}
+                    onChange={(event) =>
+                      updateRow(index, { model: event.target.value })
+                    }
+                    required
+                  />
+                </Field>
+                <Field
+                  className="min-w-0 flex-1"
+                  data-invalid={!priceValid(row.rate)}
+                >
+                  <FieldLabel htmlFor={`settings-${kind}-rate-${index}`}>
+                    {t.voiceModelRate}
+                  </FieldLabel>
+                  <Input
+                    id={`settings-${kind}-rate-${index}`}
+                    inputMode="decimal"
+                    value={row.rate}
+                    onChange={(event) =>
+                      updateRow(index, { rate: event.target.value })
+                    }
+                    aria-describedby={`settings-${kind}-rate-help-${index}`}
+                    required
+                  />
+                  <FieldDescription id={`settings-${kind}-rate-help-${index}`}>
+                    {unit}
+                  </FieldDescription>
+                </Field>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  aria-label={t.voiceModelRemove}
+                  disabled={models.length <= 1}
+                  onClick={() =>
+                    setModels((current) =>
+                      current.filter((_, position) => position !== index)
+                    )
+                  }
+                >
+                  <Trash2Icon />
+                </Button>
+              </div>
+            ))}
+            <div>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() =>
+                  setModels((current) => [...current, { model: "", rate: "" }])
+                }
+              >
+                <PlusIcon data-icon="inline-start" />
+                {t.voiceModelAdd}
+              </Button>
+            </div>
             <Field>
-              <FieldLabel htmlFor="settings-available-models">
-                {t.availableModels}
+              <FieldLabel htmlFor={`settings-${kind}-default`}>
+                {t.voiceModelDefault}
               </FieldLabel>
-              <Textarea
-                id="settings-available-models"
-                className="min-h-56 font-mono"
-                spellCheck={false}
-                value={value}
-                onChange={(event) => setValue(event.target.value)}
-                required
-              />
-              <FieldDescription>{t.availableModelsHelp}</FieldDescription>
+              <Select
+                value={defaultValue}
+                onValueChange={(value) => value && setDefaultValue(value)}
+              >
+                <SelectTrigger id={`settings-${kind}-default`}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {models
+                      .filter((row) => row.model.trim())
+                      .map((row) => (
+                        <SelectItem
+                          key={row.model.trim()}
+                          value={row.model.trim()}
+                        >
+                          {row.model.trim()}
+                        </SelectItem>
+                      ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <FieldDescription>{t.voiceModelDefaultHelp}</FieldDescription>
             </Field>
-            <Button type="submit" disabled={pending}>
+            {(models.length === 0 || !rowsValid || !defaultValid) && (
+              <FieldDescription>{t.voiceModelInvalid}</FieldDescription>
+            )}
+            <Button
+              className="self-start"
+              type="submit"
+              disabled={pending || !rowsValid || !defaultValid}
+            >
               {pending && <Spinner data-icon="inline-start" />}
               {t.saveSettings}
             </Button>
@@ -7699,7 +6265,6 @@ function RuntimeSettings({
   const t = copy[locale]
   const [settings, setSettings] = useState({
     upstream_base: initial.upstream_base,
-    model_price_multiplier: initial.model_price_multiplier,
     allow_all_users_debt: initial.allow_all_users_debt,
     response_body_limit: initial.response_body_limit,
     affinity_ttl_seconds: initial.affinity_ttl_seconds,
@@ -7748,25 +6313,6 @@ function RuntimeSettings({
                 required
               />
               <FieldDescription>{t.upstreamHint}</FieldDescription>
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="settings-model-price-multiplier">
-                {t.modelPriceMultiplier}
-              </FieldLabel>
-              <Input
-                id="settings-model-price-multiplier"
-                type="number"
-                inputMode="decimal"
-                min="0.000000001"
-                max="1000"
-                step="any"
-                value={settings.model_price_multiplier}
-                onChange={(event) =>
-                  update("model_price_multiplier", event.target.value)
-                }
-                required
-              />
-              <FieldDescription>{t.modelPriceMultiplierHint}</FieldDescription>
             </Field>
             <Field orientation="horizontal">
               <FieldContent>
@@ -7911,10 +6457,10 @@ type ProviderAuditChartPoint = {
   hour_start: number
   failure_rate: number | null
   requests: number
-  input_tokens: number
+  audio_seconds: number
 }
 
-type ProviderAuditMetricKey = "failure_rate" | "requests" | "input_tokens"
+type ProviderAuditMetricKey = "failure_rate" | "requests" | "audio_seconds"
 
 function ProviderAuditMetricChart({
   chartData,
@@ -8028,9 +6574,9 @@ function ProviderAuditPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           requests: summary.requests + row.requests,
           successful: summary.successful + row.successful_requests,
           failed: summary.failed + row.failed_requests,
-          input_tokens: summary.input_tokens + row.input_tokens,
+          audio_seconds: summary.audio_seconds + row.audio_seconds,
         }),
-        { requests: 0, successful: 0, failed: 0, input_tokens: 0 }
+        { requests: 0, successful: 0, failed: 0, audio_seconds: 0 }
       ),
     [filteredRows]
   )
@@ -8042,17 +6588,17 @@ function ProviderAuditPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
     const end = Math.floor(data.until / 3600) * 3600
     const byHour = new Map<
       number,
-      { requests: number; failed: number; input_tokens: number }
+      { requests: number; failed: number; audio_seconds: number }
     >()
     for (const row of filteredRows) {
       const value = byHour.get(row.hour_start) ?? {
         requests: 0,
         failed: 0,
-        input_tokens: 0,
+        audio_seconds: 0,
       }
       value.requests += row.requests
       value.failed += row.failed_requests
-      value.input_tokens += row.input_tokens
+      value.audio_seconds += row.audio_seconds
       byHour.set(row.hour_start, value)
     }
     return Array.from(
@@ -8064,7 +6610,7 @@ function ProviderAuditPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           hour_start: hour,
           failure_rate: value?.requests ? value.failed / value.requests : null,
           requests: value?.requests ?? 0,
-          input_tokens: value?.input_tokens ?? 0,
+          audio_seconds: value?.audio_seconds ?? 0,
         }
       }
     )
@@ -8078,8 +6624,8 @@ function ProviderAuditPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
       label: t.providerAuditTotalRequests,
       color: "var(--chart-2)",
     },
-    input_tokens: {
-      label: t.providerAuditInputTokens,
+    audio_seconds: {
+      label: t.providerAuditAudioSeconds,
       color: "var(--chart-3)",
     },
   } satisfies ChartConfig
@@ -8136,9 +6682,9 @@ function ProviderAuditPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
               </p>
             </div>
             <div className="bg-background p-4">
-              <dt>{t.providerAuditInputTokens}</dt>
+              <dt>{t.providerAuditAudioSeconds}</dt>
               <dd className="mt-1 text-2xl font-semibold tabular-nums">
-                {totals.input_tokens.toLocaleString(locale)}
+                {formatSeconds(totals.audio_seconds, locale)}
               </dd>
             </div>
           </div>
@@ -8201,11 +6747,11 @@ function ProviderAuditPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
               <ProviderAuditMetricChart
                 chartData={chartData}
                 chartConfig={chartConfig}
-                dataKey="input_tokens"
-                label={t.providerAuditInputTokensChart}
-                formatValue={(value) => value.toLocaleString(locale)}
+                dataKey="audio_seconds"
+                label={t.providerAuditAudioSecondsChart}
+                formatValue={(value) => formatSeconds(value, locale)}
                 locale={locale}
-                yAxisWidth={80}
+                yAxisWidth={64}
               />
             </div>
           )}
@@ -8238,8 +6784,10 @@ function ProviderAuditPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                       {t.providerAuditTotalRequests}
                     </TableHead>
                     <TableHead className="text-right">
-                      {t.providerAuditInputTokens}
+                      {t.providerAuditAudioSeconds}
                     </TableHead>
+                    <TableHead className="text-right">{t.characters}</TableHead>
+                    <TableHead className="text-right">{t.cost}</TableHead>
                     <TableHead className="text-right">
                       {t.providerAuditSuccessfulRequests}
                     </TableHead>
@@ -8278,7 +6826,13 @@ function ProviderAuditPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                         {row.requests.toLocaleString(locale)}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
-                        {row.input_tokens.toLocaleString(locale)}
+                        {formatSeconds(row.audio_seconds, locale)}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {row.characters.toLocaleString(locale)}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {formatUsd(row.cost_usd_nanos, locale)}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
                         {row.successful_requests.toLocaleString(locale)}
@@ -8311,12 +6865,10 @@ type UsageMetric = keyof PivotCell
 const pivotDimensions: PivotDimension[] = ["user", "consumer", "model", "date"]
 const usageMetrics: UsageMetric[] = [
   "requests",
-  "input_tokens",
-  "output_tokens",
-  "cached_tokens",
-  "official_cost_usd_nanos",
-  "actual_cost_usd_nanos",
+  "audio_seconds",
+  "characters",
   "network_transport_bytes",
+  "cost_usd_nanos",
 ]
 
 function usageConsumerLabel(row: UsageRow) {
@@ -8331,7 +6883,15 @@ function usageDimensionLabel(row: UsageRow, dimension: PivotDimension) {
 }
 function usageAggregateLabel(metric: UsageMetric, t: typeof copy.zh) {
   if (metric === "requests") return `COUNT(${t.requestCount})`
-  return `SUM(${metric === "input_tokens" ? t.inputTokens : metric === "cached_tokens" ? t.cachedInputTokens : metric === "output_tokens" ? t.outputTokens : metric === "official_cost_usd_nanos" ? t.officialCost : metric === "actual_cost_usd_nanos" ? t.actualCost : t.networkTransport})`
+  return `SUM(${
+    metric === "audio_seconds"
+      ? t.audioSeconds
+      : metric === "characters"
+        ? t.characters
+        : metric === "cost_usd_nanos"
+          ? t.cost
+          : t.networkTransport
+  })`
 }
 function uniqueUsageOptions(
   rows: UsageRow[],
@@ -8387,20 +6947,16 @@ function pivotUsageRows(
     const pivotRow = grouped.get(rowId) ?? { id: rowId, values: row, cells: {} }
     const cell = pivotRow.cells[columnId] ?? {
       requests: 0,
-      input_tokens: 0,
-      cached_tokens: 0,
-      output_tokens: 0,
-      official_cost_usd_nanos: 0,
-      actual_cost_usd_nanos: 0,
+      audio_seconds: 0,
+      characters: 0,
       network_transport_bytes: 0,
+      cost_usd_nanos: 0,
     }
     cell.requests += row.requests
-    cell.input_tokens += row.input_tokens
-    cell.cached_tokens += row.cached_tokens
-    cell.output_tokens += row.output_tokens
-    cell.official_cost_usd_nanos += row.official_cost_usd_nanos
-    cell.actual_cost_usd_nanos += row.actual_cost_usd_nanos
+    cell.audio_seconds += row.audio_seconds
+    cell.characters += row.characters
     cell.network_transport_bytes += row.network_transport_bytes
+    cell.cost_usd_nanos += row.cost_usd_nanos
     pivotRow.cells[columnId] = cell
     grouped.set(rowId, pivotRow)
   }
@@ -8418,6 +6974,18 @@ function usagePivotKey(row: UsageRow, dimensions: PivotDimension[]) {
       .join("\u001f") || "total"
   )
 }
+function transcriptionText(responseBody?: string): string | undefined {
+  if (!responseBody) return undefined
+  try {
+    const value = JSON.parse(responseBody) as { text?: unknown }
+    return typeof value.text === "string" && value.text.length > 0
+      ? value.text
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
 function parseJson(value?: string): unknown {
   if (!value) return undefined
   try {
@@ -8472,19 +7040,11 @@ function StatusBadge({ status, locale }: { status: string; locale: Locale }) {
     </Badge>
   )
 }
-function TokenMetric({
-  label,
-  value,
-  locale,
-}: {
-  label: string
-  value: number
-  locale: Locale
-}) {
+function MetricValue({ label, value }: { label: string; value: string }) {
   return (
     <span className="flex flex-col gap-0.5">
       <span className="text-muted-foreground">{label}</span>
-      <span>{value.toLocaleString(locale)}</span>
+      <span>{value}</span>
     </span>
   )
 }
@@ -8611,6 +7171,11 @@ function formatLatency(milliseconds: number | undefined) {
 function formatBytes(bytes: number, locale: Locale) {
   return `${bytes.toLocaleString(locale)} B`
 }
+function formatSeconds(seconds: number, locale: Locale) {
+  return `${seconds.toLocaleString(locale === "zh" ? "zh-CN" : "en-US", {
+    maximumFractionDigits: 2,
+  })} s`
+}
 function formatUsd(nanos: number | undefined, locale: Locale) {
   if (typeof nanos !== "number") return "—"
   return new Intl.NumberFormat(locale === "zh" ? "zh-CN" : "en-US", {
@@ -8621,40 +7186,9 @@ function formatUsd(nanos: number | undefined, locale: Locale) {
   }).format(nanos / 1_000_000_000)
 }
 
-function formatMultiplier(nanos: number, locale: Locale) {
-  return `${(nanos / 1_000_000_000).toLocaleString(
-    locale === "zh" ? "zh-CN" : "en-US",
-    { maximumFractionDigits: 9 }
-  )}×`
-}
-
 function compressionRatio(contentBytes: number, transportBytes: number) {
   if (contentBytes <= 0) return "—"
   return `${((1 - transportBytes / contentBytes) * 100).toFixed(1)}%`
-}
-
-function cacheHitRate(
-  cachedTokens: number,
-  inputTokens: number,
-  locale: Locale
-) {
-  if (inputTokens <= 0) return "—"
-  return (cachedTokens / inputTokens).toLocaleString(locale, {
-    style: "percent",
-    maximumFractionDigits: 1,
-  })
-}
-
-function inputOutputRatio(
-  inputTokens: number,
-  outputTokens: number,
-  locale: Locale
-) {
-  if (inputTokens <= 0 && outputTokens <= 0) return "—"
-  if (outputTokens <= 0) return "∞:1"
-  return `${(inputTokens / outputTokens).toLocaleString(locale, {
-    maximumFractionDigits: 2,
-  })}:1`
 }
 
 function roleLabel(role: User["role"], locale: Locale) {
@@ -8684,18 +7218,15 @@ function pageForPath(pathname: string): Page {
         "/dashboard": "dashboard",
         "/providers": "providers",
         "/consumers": "consumers",
-        "/codex-integration": "codex-integration",
-        "/dsh-integration": "dsh-integration",
-        "/opencode-integration": "opencode-integration",
         "/direct-api-integration": "direct-api-integration",
+        "/voice": "voice",
         "/usage": "usage",
         "/audit": "audit",
         "/topups": "topups",
-        "/model-prices": "model-prices",
+        "/voice-prices": "voice-prices",
         "/system-resources": "system-resources",
         "/admin-audit": "admin-audit",
         "/provider-audit": "provider-audit",
-        "/web-search": "web-search",
         "/users": "users",
         "/settings": "settings",
       } as const
@@ -8712,15 +7243,12 @@ function pageDescription(page: Page, locale: Locale) {
     dashboard: t.pageDashboard,
     providers: t.pageProviders,
     consumers: t.pageConsumers,
-    "codex-integration": t.pageCodexIntegration,
-    "dsh-integration": t.pageDshIntegration,
-    "opencode-integration": t.pageOpenCodeIntegration,
     "direct-api-integration": t.pageDirectApiIntegration,
-    "web-search": t.pageWebSearch,
+    voice: t.pageVoice,
     usage: t.pageUsage,
     audit: t.pageAudit,
     topups: t.pageTopups,
-    "model-prices": t.pageModelPrices,
+    "voice-prices": t.pageVoicePrices,
     "system-resources": t.pageSystemResources,
     "admin-audit": t.pageAdminAudit,
     "provider-audit": t.pageProviderAudit,

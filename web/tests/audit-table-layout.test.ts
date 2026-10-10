@@ -17,9 +17,7 @@ test("inference audit keeps its table columns aligned around user and consumer",
     "{t.consumer}",
     "{t.time}",
     "{t.model}",
-    "{t.actualCost}",
-    "{t.officialCost}",
-    "{t.priceMultiplier}",
+    "{t.cost}",
     "{t.provider}",
     "{t.threadId}",
     "{t.status}",
@@ -47,11 +45,8 @@ test("inference audit keeps its table columns aligned around user and consumer",
     firstRow,
     /<LinkitUserInfo[\s\S]*?<\/TableCell>\s*<TableCell className="font-medium">\s*\{row\.consumer_name\}\s*<\/TableCell>\s*<TableCell className="whitespace-nowrap">/
   )
-  assert.ok(firstRow.indexOf("{t.cacheHitRate}") > firstRow.indexOf("{t.cachedInput}"))
-  assert.match(
-    firstRow,
-    /cacheHitRate\(\s*row\.cached_tokens,\s*row\.input_tokens,\s*locale\s*\)/
-  )
-  assert.match(firstRow, /row\.peak \? t\.pricingPeak : t\.pricingOffPeak/)
-  assert.doesNotMatch(firstRow, /row\.upstream_model/)
+  assert.match(firstRow, /formatSeconds\(row\.audio_seconds, locale\)/)
+  assert.match(firstRow, /row\.characters\.toLocaleString\(locale\)/)
+  assert.match(firstRow, /formatUsd\(row\.cost_usd_nanos, locale\)/)
+  assert.doesNotMatch(firstRow, /row\.upstream_model|row\.input_tokens/)
 })

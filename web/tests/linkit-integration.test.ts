@@ -34,7 +34,7 @@ test("console delegates Linkit identity UI to the published components", async (
 
 test("inference audit leads with one Linkit identity column and users do not duplicate IDs", async () => {
   const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8")
-  const audit = app.slice(app.indexOf("function AuditPage"), app.indexOf("function AuditDetailPage"))
+  const audit = app.slice(app.indexOf("function AuditPage"), app.indexOf("function RequestDetailPage"))
   const users = app.slice(app.indexOf("function UsersPage"), app.indexOf("function AdminAuditPage"))
 
   assert.match(
@@ -57,10 +57,10 @@ test("inference audit leads with one Linkit identity column and users do not dup
 
 test("the data navigation and page copy call this view inference audit", async () => {
   const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8")
-  assert.match(app, /audit: "推理审计"/)
-  assert.match(app, /audit: "Inference audit"/)
-  assert.match(app, /auditTitle: "推理审计"/)
-  assert.match(app, /auditTitle: "Inference audit"/)
-  assert.match(app, /backToAudit: "返回推理审计"/)
-  assert.match(app, /backToAudit: "Back to inference audit"/)
+  assert.match(app, /"audit": "推理审计"/)
+  assert.match(app, /"audit": "Inference audit"/)
+  assert.match(app, /"auditTitle": "推理审计"/)
+  assert.match(app, /"auditTitle": "Inference audit"/)
+  assert.match(app, /"backToAudit": "返回推理审计"/)
+  assert.match(app, /"backToAudit": "Back to inference audit"/)
 })

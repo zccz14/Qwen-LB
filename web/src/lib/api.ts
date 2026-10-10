@@ -9,6 +9,13 @@ type ApiError = {
   }
 }
 
+export type ApiResult<T> = { data: T; headers: Headers }
+
+/** A Consumer secret as issued by Qwen-LB: `sk-` prefix, no whitespace. */
+export function isConsumerSecret(value: string) {
+  return value.startsWith("sk-") && value.length > 3 && !/\s/u.test(value)
+}
+
 async function accessToken(sdk: AuthSdk, forceRefresh = false) {
   const current = sdk.session.getState()
   if (!forceRefresh && current.accessToken) return current.accessToken
@@ -17,31 +24,18 @@ async function accessToken(sdk: AuthSdk, forceRefresh = false) {
   return refreshed.accessToken
 }
 
-export async function api<T>(sdk: AuthSdk, path: string, init?: RequestInit): Promise<T> {
-  return requestJson<T>(sdk, path, init, true)
-}
-
-export async function apiForm<T>(
-  sdk: AuthSdk,
-  path: string,
-  form: FormData,
-  init?: RequestInit
-): Promise<T> {
-  return requestJson<T>(sdk, path, { ...init, method: "POST", body: form }, false)
-}
-
-async function requestJson<T>(
+async function fetchWithAuth(
   sdk: AuthSdk,
   path: string,
   init: RequestInit | undefined,
-  jsonBody: boolean
-): Promise<T> {
+  options: { accept: string; jsonBody: boolean }
+) {
   async function request(forceRefresh: boolean) {
     return fetch(path, {
       ...init,
       headers: {
-        accept: "application/json",
-        ...(jsonBody && init?.body ? { "content-type": "application/json" } : {}),
+        accept: options.accept,
+        ...(options.jsonBody && init?.body ? { "content-type": "application/json" } : {}),
         ...init?.headers,
         authorization: `Bearer ${await accessToken(sdk, forceRefresh)}`,
       },
@@ -50,6 +44,19 @@ async function requestJson<T>(
 
   let response = await request(false)
   if (response.status === 401 && sdk.session.getState().refreshToken) response = await request(true)
+  return response
+}
+
+function apiError(response: Response, payload: unknown): Error {
+  const error = "error" in (payload as object) ? (payload as ApiError).error : undefined
+  const requestError = new Error(error?.message || `Request failed (${response.status})`) as Error & {
+    reason?: string
+  }
+  requestError.reason = error?.reason
+  return requestError
+}
+
+async function readJson<T>(response: Response): Promise<ApiResult<T>> {
   const body = await response.text()
   let payload: T | ApiError
   try {
@@ -61,13 +68,67 @@ async function requestJson<T>(
         : `Request failed (${response.status})`
     )
   }
+  if (!response.ok) throw apiError(response, payload)
+  return { data: payload as T, headers: response.headers }
+}
+
+export async function api<T>(sdk: AuthSdk, path: string, init?: RequestInit): Promise<T> {
+  return (await apiWithHeaders<T>(sdk, path, init)).data
+}
+
+export async function apiWithHeaders<T>(
+  sdk: AuthSdk,
+  path: string,
+  init?: RequestInit
+): Promise<ApiResult<T>> {
+  const response = await fetchWithAuth(sdk, path, init, {
+    accept: "application/json",
+    jsonBody: true,
+  })
+  return readJson<T>(response)
+}
+
+export async function apiForm<T>(
+  sdk: AuthSdk,
+  path: string,
+  form: FormData,
+  init?: RequestInit
+): Promise<T> {
+  return (await apiFormWithHeaders<T>(sdk, path, form, init)).data
+}
+
+export async function apiFormWithHeaders<T>(
+  sdk: AuthSdk,
+  path: string,
+  form: FormData,
+  init?: RequestInit
+): Promise<ApiResult<T>> {
+  const response = await fetchWithAuth(sdk, path, { ...init, method: "POST", body: form }, {
+    accept: "application/json",
+    jsonBody: false,
+  })
+  return readJson<T>(response)
+}
+
+/** Posts a JSON body and reads a binary reply (audio bytes) with its headers. */
+export async function apiBlob(
+  sdk: AuthSdk,
+  path: string,
+  init?: RequestInit
+): Promise<ApiResult<Blob>> {
+  const response = await fetchWithAuth(sdk, path, init, {
+    accept: "*/*",
+    jsonBody: true,
+  })
   if (!response.ok) {
-    const error = "error" in (payload as object) ? (payload as ApiError).error : undefined
-    const requestError = new Error(error?.message || `Request failed (${response.status})`) as Error & {
-      reason?: string
+    const body = await response.text()
+    let payload: unknown
+    try {
+      payload = JSON.parse(body)
+    } catch (cause) {
+      throw new Error(`Request failed (${response.status})`, { cause })
     }
-    requestError.reason = error?.reason
-    throw requestError
+    throw apiError(response, payload)
   }
-  return payload as T
+  return { data: await response.blob(), headers: response.headers }
 }
