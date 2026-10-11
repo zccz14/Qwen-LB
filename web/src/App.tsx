@@ -396,6 +396,8 @@ type Audit = {
 type AuditPageResponse = { rows: Audit[]; total: number }
 type AuditNavigation = { id: string; request_id: string; created_at: number }
 type AuditDetail = Audit & {
+  input_tokens: number
+  output_tokens: number
   upstream_http_version?: string
   downstream_accept_encoding?: string
   downstream_content_encoding?: string
@@ -446,7 +448,12 @@ type ProviderAuditResponse = {
   rows: ProviderAuditRow[]
 }
 type TranscriptionModelRate = { model: string; price_usd_per_second: string }
-type SpeechModelRate = { model: string; price_usd_per_character: string }
+type SpeechModelRate = {
+  model: string
+  price_usd_per_character?: string
+  price_usd_per_million_input_tokens?: string
+  price_usd_per_million_output_tokens?: string
+}
 type SettingsData = {
   role: Role
   auth_issuer?: string
@@ -541,6 +548,8 @@ const copy = {
     "pricingModels": "可用模型",
     "audioSeconds": "音频时长",
     "characters": "字符数",
+    "inputTokens": "输入 Token",
+    "outputTokens": "输出 Token",
     "cost": "费用 (USD)",
     "usageCost": "用量与费用",
     "consumedUsdBefore": "累计消费前 (USD)",
@@ -823,8 +832,14 @@ const copy = {
     "transcriptionModelsDescription": "下游可调用的转写模型与单价（USD / 秒）。",
     "transcriptionModelsUnit": "USD / 秒",
     "speechModels": "语音合成模型",
-    "speechModelsDescription": "下游可调用的合成模型与单价（USD / 字符）。",
+    "speechModelsDescription": "下游可调用的合成模型与单价（USD / 字符或 USD / 百万 Token）。",
     "speechModelsUnit": "USD / 字符",
+    "speechPricingKind": "计价方式",
+    "speechPricingCharacter": "按字符",
+    "speechPricingToken": "按 Token",
+    "voiceTokenInput": "输入",
+    "voiceTokenOutput": "输出",
+    "voiceMillionTokenUnit": "百万 Token",
     "voiceModelRate": "单价",
     "voiceModelAdd": "添加模型",
     "voiceModelRemove": "移除模型",
@@ -927,7 +942,7 @@ const copy = {
     "voiceDownload": "下载 WAV",
     "voiceWavNote": "响应格式固定为 WAV。",
     "voicePricesTitle": "语音计价",
-    "voicePricesDescription": "当前生效的语音单价快照：转写按音频秒数计费，语音合成按输出字符数计费。",
+    "voicePricesDescription": "当前生效的语音单价快照：转写按音频秒数计费，语音合成按输出字符数或输入/输出 Token 数计费。",
     "voicePricingSource": "打开 Qwen 模型文档",
     "voicePricingSourceUrl": "https://www.qianwenai.com/models/qwen-audio-3.0-asr-flash",
     "voiceSecondUnit": "秒",
@@ -993,6 +1008,8 @@ const copy = {
     "pricingModels": "Available models",
     "audioSeconds": "Audio seconds",
     "characters": "Characters",
+    "inputTokens": "Input tokens",
+    "outputTokens": "Output tokens",
     "cost": "Cost (USD)",
     "usageCost": "Usage and cost",
     "consumedUsdBefore": "Cumulative consumption before (USD)",
@@ -1275,8 +1292,14 @@ const copy = {
     "transcriptionModelsDescription": "Downstream-callable transcription models and their rate (USD per second).",
     "transcriptionModelsUnit": "USD / second",
     "speechModels": "Speech models",
-    "speechModelsDescription": "Downstream-callable speech models and their rate (USD per character).",
+    "speechModelsDescription": "Downstream-callable speech models and their rate (USD per character or per million tokens).",
     "speechModelsUnit": "USD / character",
+    "speechPricingKind": "Pricing",
+    "speechPricingCharacter": "Per character",
+    "speechPricingToken": "Per token",
+    "voiceTokenInput": "Input",
+    "voiceTokenOutput": "Output",
+    "voiceMillionTokenUnit": "million tokens",
     "voiceModelRate": "Rate",
     "voiceModelAdd": "Add model",
     "voiceModelRemove": "Remove model",
@@ -1379,7 +1402,7 @@ const copy = {
     "voiceDownload": "Download WAV",
     "voiceWavNote": "The response format is always WAV.",
     "voicePricesTitle": "Voice pricing",
-    "voicePricesDescription": "The active voice rate snapshot: transcription bills per audio second, speech synthesis per output character.",
+    "voicePricesDescription": "The active voice rate snapshot: transcription bills per audio second, speech synthesis per output character or per input/output token.",
     "voicePricingSource": "Open the Qwen model docs",
     "voicePricingSourceUrl": "https://www.qianwenai.com/models/qwen-audio-3.0-asr-flash",
     "voiceSecondUnit": "second",
@@ -2631,8 +2654,20 @@ function VoicePricesPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                       <code>{row.model}</code>
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
-                      {row.price_usd_per_character} USD /{" "}
-                      {t.voiceCharacterUnit}
+                      {row.price_usd_per_character !== undefined ? (
+                        <>
+                          {row.price_usd_per_character} USD /{" "}
+                          {t.voiceCharacterUnit}
+                        </>
+                      ) : (
+                        <>
+                          {t.voiceTokenInput}{" "}
+                          {row.price_usd_per_million_input_tokens} ·{" "}
+                          {t.voiceTokenOutput}{" "}
+                          {row.price_usd_per_million_output_tokens} USD /{" "}
+                          {t.voiceMillionTokenUnit}
+                        </>
+                      )}
                     </TableCell>
                   </TableRow>
                 ))}
@@ -5280,6 +5315,18 @@ function RequestSummary({
             rows={[
               [labels.audioSeconds, formatSeconds(data.audio_seconds, locale)],
               [labels.characters, data.characters.toLocaleString(locale)],
+              ...((data.input_tokens > 0 || data.output_tokens > 0
+                ? [
+                    [
+                      labels.inputTokens,
+                      data.input_tokens.toLocaleString(locale),
+                    ],
+                    [
+                      labels.outputTokens,
+                      data.output_tokens.toLocaleString(locale),
+                    ],
+                  ]
+                : []) as [string, unknown][]),
               [labels.cost, formatUsd(data.cost_usd_nanos, locale)],
               [
                 labels.consumedUsdBefore,
@@ -5835,7 +5882,13 @@ function SettingsPage({
             kind="speech"
             rows={data.speech_models.map((item) => ({
               model: item.model,
-              rate: item.price_usd_per_character,
+              rate: item.price_usd_per_character ?? "",
+              pricing:
+                item.price_usd_per_character === undefined
+                  ? ("token" as const)
+                  : ("character" as const),
+              inputRate: item.price_usd_per_million_input_tokens ?? "",
+              outputRate: item.price_usd_per_million_output_tokens ?? "",
             }))}
             defaultModel={data.default_speech_model}
           />
@@ -5931,7 +5984,13 @@ function ProviderConcurrencySettings({
   )
 }
 
-type VoiceModelDraft = { model: string; rate: string }
+type VoiceModelDraft = {
+  model: string
+  rate: string
+  pricing?: "character" | "token"
+  inputRate?: string
+  outputRate?: string
+}
 
 function VoiceModelsSettings({
   sdk,
@@ -5968,9 +6027,14 @@ function VoiceModelsSettings({
     /^\d+(?:\.\d{1,9})?$/u.test(value.trim()) && Number(value) > 0
   const modelValid = (value: string) =>
     /^[A-Za-z0-9._:-]{1,128}$/u.test(value.trim())
-  const rowsValid =
-    models.length > 0 &&
-    models.every((row) => modelValid(row.model) && priceValid(row.rate))
+  const tokenRow = (row: VoiceModelDraft) =>
+    kind === "speech" && row.pricing === "token"
+  const rowValid = (row: VoiceModelDraft) =>
+    modelValid(row.model) &&
+    (tokenRow(row)
+      ? priceValid(row.inputRate ?? "") && priceValid(row.outputRate ?? "")
+      : priceValid(row.rate))
+  const rowsValid = models.length > 0 && models.every(rowValid)
   const defaultValid = models.some(
     (row) => row.model.trim() === defaultValue
   )
@@ -6000,7 +6064,16 @@ function VoiceModelsSettings({
               model: row.model.trim(),
               ...(kind === "transcription"
                 ? { price_usd_per_second: row.rate.trim() }
-                : { price_usd_per_character: row.rate.trim() }),
+                : tokenRow(row)
+                  ? {
+                      price_usd_per_million_input_tokens: (
+                        row.inputRate ?? ""
+                      ).trim(),
+                      price_usd_per_million_output_tokens: (
+                        row.outputRate ?? ""
+                      ).trim(),
+                    }
+                  : { price_usd_per_character: row.rate.trim() }),
             })),
             default_model: defaultValue,
           }),
@@ -6046,27 +6119,111 @@ function VoiceModelsSettings({
                     required
                   />
                 </Field>
-                <Field
-                  className="min-w-0 flex-1"
-                  data-invalid={!priceValid(row.rate)}
-                >
-                  <FieldLabel htmlFor={`settings-${kind}-rate-${index}`}>
-                    {t.voiceModelRate}
-                  </FieldLabel>
-                  <Input
-                    id={`settings-${kind}-rate-${index}`}
-                    inputMode="decimal"
-                    value={row.rate}
-                    onChange={(event) =>
-                      updateRow(index, { rate: event.target.value })
-                    }
-                    aria-describedby={`settings-${kind}-rate-help-${index}`}
-                    required
-                  />
-                  <FieldDescription id={`settings-${kind}-rate-help-${index}`}>
-                    {unit}
-                  </FieldDescription>
-                </Field>
+                {kind === "speech" && (
+                  <Field className="w-40">
+                    <FieldLabel htmlFor={`settings-${kind}-pricing-${index}`}>
+                      {t.speechPricingKind}
+                    </FieldLabel>
+                    <Select
+                      value={row.pricing ?? "character"}
+                      onValueChange={(value) => {
+                        if (value === "character" || value === "token") {
+                          updateRow(index, { pricing: value })
+                        }
+                      }}
+                    >
+                      <SelectTrigger id={`settings-${kind}-pricing-${index}`}>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectItem value="character">
+                            {t.speechPricingCharacter}
+                          </SelectItem>
+                          <SelectItem value="token">
+                            {t.speechPricingToken}
+                          </SelectItem>
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                )}
+                {tokenRow(row) ? (
+                  <>
+                    <Field
+                      className="min-w-0 flex-1"
+                      data-invalid={!priceValid(row.inputRate ?? "")}
+                    >
+                      <FieldLabel
+                        htmlFor={`settings-${kind}-input-rate-${index}`}
+                      >
+                        {t.voiceTokenInput}
+                      </FieldLabel>
+                      <Input
+                        id={`settings-${kind}-input-rate-${index}`}
+                        inputMode="decimal"
+                        value={row.inputRate ?? ""}
+                        onChange={(event) =>
+                          updateRow(index, { inputRate: event.target.value })
+                        }
+                        aria-describedby={`settings-${kind}-input-rate-help-${index}`}
+                        required
+                      />
+                      <FieldDescription
+                        id={`settings-${kind}-input-rate-help-${index}`}
+                      >
+                        USD / {t.voiceMillionTokenUnit}
+                      </FieldDescription>
+                    </Field>
+                    <Field
+                      className="min-w-0 flex-1"
+                      data-invalid={!priceValid(row.outputRate ?? "")}
+                    >
+                      <FieldLabel
+                        htmlFor={`settings-${kind}-output-rate-${index}`}
+                      >
+                        {t.voiceTokenOutput}
+                      </FieldLabel>
+                      <Input
+                        id={`settings-${kind}-output-rate-${index}`}
+                        inputMode="decimal"
+                        value={row.outputRate ?? ""}
+                        onChange={(event) =>
+                          updateRow(index, { outputRate: event.target.value })
+                        }
+                        aria-describedby={`settings-${kind}-output-rate-help-${index}`}
+                        required
+                      />
+                      <FieldDescription
+                        id={`settings-${kind}-output-rate-help-${index}`}
+                      >
+                        USD / {t.voiceMillionTokenUnit}
+                      </FieldDescription>
+                    </Field>
+                  </>
+                ) : (
+                  <Field
+                    className="min-w-0 flex-1"
+                    data-invalid={!priceValid(row.rate)}
+                  >
+                    <FieldLabel htmlFor={`settings-${kind}-rate-${index}`}>
+                      {t.voiceModelRate}
+                    </FieldLabel>
+                    <Input
+                      id={`settings-${kind}-rate-${index}`}
+                      inputMode="decimal"
+                      value={row.rate}
+                      onChange={(event) =>
+                        updateRow(index, { rate: event.target.value })
+                      }
+                      aria-describedby={`settings-${kind}-rate-help-${index}`}
+                      required
+                    />
+                    <FieldDescription id={`settings-${kind}-rate-help-${index}`}>
+                      {unit}
+                    </FieldDescription>
+                  </Field>
+                )}
                 <Button
                   type="button"
                   size="icon"
@@ -6088,7 +6245,16 @@ function VoiceModelsSettings({
                 type="button"
                 variant="outline"
                 onClick={() =>
-                  setModels((current) => [...current, { model: "", rate: "" }])
+                  setModels((current) => [
+                    ...current,
+                    {
+                      model: "",
+                      rate: "",
+                      pricing: "character",
+                      inputRate: "",
+                      outputRate: "",
+                    },
+                  ])
                 }
               >
                 <PlusIcon data-icon="inline-start" />
