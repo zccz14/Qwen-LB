@@ -19,7 +19,7 @@ web
 
 ## Product Purpose
 
-本产品是一个以 Rust 编写、以 SQLite 持久化、最终可作为单一 Binary 部署的 Qwen API 反向代理与负载均衡系统。用户用一条 Qwen API Key 注册一个上游提供商，root 与管理员可管理全局 Provider 池；v0.1 覆盖语音能力——语音转写（ASR）与语音合成（TTS）：系统只接入 Qwen 上游并自行完成协议适配，对下游暴露标准音频接口（`/v1/audio/transcriptions`、`/v1/audio/speech`）与模型列表，调用方无需适配 Qwen 原生 multimodal-generation 协议。与官方直连相比，它提供多 Key 池化调度、按请求的统一 ID 与全量审计。
+本产品是一个以 Rust 编写、以 SQLite 持久化、最终可作为单一 Binary 部署的 Qwen API 反向代理与负载均衡系统。用户用一条 Qwen API Key 注册一个上游提供商，root 与管理员可管理全局 Provider 池；v0.1 覆盖语音能力——语音转写（ASR）与语音合成（TTS）：系统只接入 Qwen 上游并自行完成协议适配，对下游暴露标准音频接口（`/v1/audio/transcriptions`、`/v1/audio/speech`）与模型列表；每个合成模型行各自标注上游接口形态（多模态生成 / 语音合成器），调用方无需适配 Qwen 原生协议。与官方直连相比，它提供多 Key 池化调度、按请求的统一 ID 与全量审计。
 
 每个上游 Provider 有 `public` / `private` 可见性，默认 `private`：`private` Provider 只服务其拥有者名下的 Consumer，`public` 才进入全站共享上游池；拥有者可在 Provider 页面自行切换。
 

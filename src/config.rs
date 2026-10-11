@@ -28,23 +28,51 @@ pub struct TranscriptionModel {
     pub price_usd_nanos_per_second: i64,
 }
 
-/// One speech-synthesis model plus the rate it bills at.
+/// One speech-synthesis model plus the rate it bills at and the upstream
+/// surface it is called on.
 ///
-/// The pricing unit selects the upstream surface: a per-character model bills
-/// from the multimodal-generation response (`usage.characters`), while a
-/// per-token model bills from the SpeechSynthesizer response
-/// (`usage.input_tokens` / `usage.output_tokens`), which only the
-/// non-real-time speech-synthesis surface produces.
+/// The pricing unit and the upstream surface are independent choices: the
+/// multimodal-generation surface serves the character-priced Qwen3-TTS
+/// models, while the non-real-time speech-synthesis surface serves both its
+/// character-priced models (CosyVoice) and token-priced models
+/// (Qwen-Audio-3.1-TTS), whose `usage` fields name the billing basis. A
+/// model row without an explicit surface derives one from its pricing unit
+/// ([`SpeechPricing::default_surface`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpeechModel {
     pub model: String,
     pub pricing: SpeechPricing,
+    pub surface: SpeechSurface,
+}
+
+/// The upstream surface one speech model is called on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SpeechSurface {
+    /// `POST {upstream_base}/api/v1/services/aigc/multimodal-generation/generation`
+    /// — the Qwen3-TTS surface, billed from `usage.characters`.
+    Multimodal,
+    /// `POST {upstream_base}/api/v1/services/audio/tts/SpeechSynthesizer`
+    /// — the non-real-time speech-synthesis surface (CosyVoice and
+    /// Qwen-Audio-3.1-TTS), billed from `usage.characters` or
+    /// `usage.input_tokens` / `usage.output_tokens` as the row's pricing
+    /// unit dictates.
+    SpeechSynthesizer,
+}
+
+impl SpeechSurface {
+    /// The stored representation in the `speech_models` setting.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Multimodal => "multimodal",
+            Self::SpeechSynthesizer => "speech_synthesizer",
+        }
+    }
 }
 
 /// The rate one speech model bills at.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SpeechPricing {
-    /// Nanodollars per synthesized output character.
+    /// Nanodollars per synthesized output character (`usage.characters`).
     PerCharacter { price_usd_nanos_per_character: i64 },
     /// Nanodollars per million tokens, input and output, as the
     /// speech-synthesis surface reports them.
@@ -52,6 +80,18 @@ pub enum SpeechPricing {
         price_usd_nanos_per_million_input_tokens: i64,
         price_usd_nanos_per_million_output_tokens: i64,
     },
+}
+
+impl SpeechPricing {
+    /// The surface a row bills through when it does not say: the historical
+    /// coupling — per-character prices on the multimodal-generation surface,
+    /// per-token prices on the speech-synthesizer surface.
+    fn default_surface(self) -> SpeechSurface {
+        match self {
+            Self::PerCharacter { .. } => SpeechSurface::Multimodal,
+            Self::PerToken { .. } => SpeechSurface::SpeechSynthesizer,
+        }
+    }
 }
 
 /// Validates a model ID the same way whether it comes from the seed migration,
@@ -148,6 +188,23 @@ fn parse_speech_pricing(item: &serde_json::Value) -> Result<SpeechPricing, Strin
     }
 }
 
+/// Reads one speech model's upstream surface. An absent field keeps the
+/// pricing unit's default surface; a present field must name a surface.
+fn parse_speech_surface(item: &serde_json::Value) -> Result<Option<SpeechSurface>, String> {
+    let Some(raw) = item.get("surface") else {
+        return Ok(None);
+    };
+    let raw = raw
+        .as_str()
+        .ok_or_else(|| "surface must be a string".to_owned())?
+        .trim();
+    match raw {
+        "multimodal" => Ok(Some(SpeechSurface::Multimodal)),
+        "speech_synthesizer" => Ok(Some(SpeechSurface::SpeechSynthesizer)),
+        _ => Err("surface must be multimodal or speech_synthesizer".to_owned()),
+    }
+}
+
 pub fn normalize_speech_models(value: serde_json::Value) -> Result<Vec<SpeechModel>, String> {
     let items = value
         .as_array()
@@ -164,10 +221,15 @@ pub fn normalize_speech_models(value: serde_json::Value) -> Result<Vec<SpeechMod
                 .ok_or_else(|| "each speech model needs a model ID".to_owned())?,
         )?;
         let pricing = parse_speech_pricing(item)?;
+        let surface = parse_speech_surface(item)?.unwrap_or_else(|| pricing.default_surface());
         if !unique.insert(model.clone()) {
             return Err(format!("duplicate speech model: {model}"));
         }
-        normalized.push(SpeechModel { model, pricing });
+        normalized.push(SpeechModel {
+            model,
+            pricing,
+            surface,
+        });
     }
     Ok(normalized)
 }
@@ -312,11 +374,16 @@ impl Config {
             .map(|item| item.price_usd_nanos_per_second)
     }
 
+    pub fn speech_model(&self, model: &str) -> Option<&SpeechModel> {
+        self.speech_models.iter().find(|item| item.model == model)
+    }
+
     pub fn speech_pricing(&self, model: &str) -> Option<SpeechPricing> {
-        self.speech_models
-            .iter()
-            .find(|item| item.model == model)
-            .map(|item| item.pricing)
+        self.speech_model(model).map(|item| item.pricing)
+    }
+
+    pub fn speech_surface(&self, model: &str) -> Option<SpeechSurface> {
+        self.speech_model(model).map(|item| item.surface)
     }
 }
 
@@ -413,6 +480,40 @@ mod tests {
                 price_usd_nanos_per_million_input_tokens: 208_333_333,
                 price_usd_nanos_per_million_output_tokens: 1_666_666_667,
             }
+        );
+        // A row without a surface derives one from its pricing unit.
+        assert_eq!(ok[0].surface, SpeechSurface::Multimodal);
+        assert_eq!(ok[1].surface, SpeechSurface::SpeechSynthesizer);
+
+        // An explicit surface decouples the pricing unit from the surface:
+        // per-character billing on the speech-synthesizer surface.
+        let explicit = normalize_speech_models(serde_json::json!([
+            {"model": "cosyvoice-v3.5-flash", "price_usd_nanos_per_character": 11111,
+             "surface": "speech_synthesizer"},
+            {"model": "qwen3-tts-flash", "price_usd_nanos_per_character": 11111,
+             "surface": "multimodal"}
+        ]))
+        .unwrap();
+        assert_eq!(explicit[0].surface, SpeechSurface::SpeechSynthesizer);
+        assert_eq!(
+            explicit[0].pricing,
+            SpeechPricing::PerCharacter {
+                price_usd_nanos_per_character: 11111
+            }
+        );
+        assert_eq!(explicit[1].surface, SpeechSurface::Multimodal);
+
+        assert!(
+            normalize_speech_models(serde_json::json!([
+                {"model": "x", "price_usd_nanos_per_character": 1, "surface": "other"}
+            ]))
+            .is_err()
+        );
+        assert!(
+            normalize_speech_models(serde_json::json!([
+                {"model": "x", "price_usd_nanos_per_character": 1, "surface": 7}
+            ]))
+            .is_err()
         );
         assert!(normalize_speech_models(serde_json::json!([])).is_err());
         assert!(
