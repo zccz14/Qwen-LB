@@ -2,14 +2,14 @@
 
 Qwen-LB 是 Qwen 语音能力（语音转写与语音合成）的反向代理与负载均衡器。它以单个 Rust 可执行文件交付，内嵌 React + shadcn 管理界面，并使用 SQLite 保存配置、权限、上游提供商、Consumer、用量和逐调用审计。
 
-对下游而言，Qwen-LB 提供标准的 OpenAI 音频接口——`/v1/audio/transcriptions` 转写音频、`/v1/audio/speech` 合成语音、`/v1/models` 列出可用模型（同时提供不带 `/v1` 前缀的别名）。协议差异被收进 LB 内部：上游调用 Qwen 原生接口——转写与按字符计费的合成走 `POST {upstream_base}/api/v1/services/aigc/multimodal-generation/generation`，按 Token 计费的合成走 `POST {upstream_base}/api/v1/services/audio/tts/SpeechSynthesizer`——由本服务完成请求构造与响应归一化。
+对下游而言，Qwen-LB 提供标准的 OpenAI 音频接口——`/v1/audio/transcriptions` 转写音频、`/v1/audio/speech` 合成语音、`/v1/models` 列出可用模型（同时提供不带 `/v1` 前缀的别名）。协议差异被收进 LB 内部：上游调用 Qwen 原生接口——转写与 Qwen3-TTS 合成走 `POST {upstream_base}/api/v1/services/aigc/multimodal-generation/generation`，CosyVoice 与 Qwen-Audio-TTS 合成走 `POST {upstream_base}/api/v1/services/audio/tts/SpeechSynthesizer`；每个合成模型行自行选择「调用方式」（多模态生成 / 语音合成器）与计价方式（字符 / Token），由本服务完成请求构造与响应归一化。
 
 ## 为什么需要 Qwen-LB
 
 Qwen 的 OpenAI 兼容层并不提供 `/audio/transcriptions`；官方文档明确「仅 Qwen3-ASR-Flash 系列模型支持 OpenAI 兼容方式调用」，且兼容形式是 `chat/completions` + `input_audio`，并非标准转写端点。实测 `qwen-audio-3.0-asr-flash` 在 `/audio/transcriptions` 与 `chat/completions` 上均不可用，只支持原生多模态生成接口。Qwen-LB 因此扮演适配器角色：
 
 - 转写：接收标准 multipart 上传（`file`、可选的 `model` 与 `language`），构造原生 `input_audio` 数据 URI 请求，把上游的 `output.text` 与 `usage.duration` 归一化为 `{"text": …}` 与按秒计费。
-- 合成：接收标准 JSON（`input`、`model`、`voice`），把上游返回的 `output.audio.url` 下载为字节流返回；按字符计费的模型按 `usage.characters` 计费，按 Token 计费的模型按 `usage.input_tokens`/`usage.output_tokens` 计费。
+- 合成：接收标准 JSON（`input`、`model`、`voice`），把上游返回的 `output.audio.url` 下载为字节流返回；模型行按「调用方式」选择上游接口（多模态生成 / 语音合成器），按计价方式计费——按字符的模型按 `usage.characters`，按 Token 的模型按 `usage.input_tokens`/`usage.output_tokens`。
 
 ## 功能
 
@@ -17,7 +17,7 @@ Qwen 的 OpenAI 兼容层并不提供 `/audio/transcriptions`；官方文档明�
 - 每个 Provider 有 `public` / `private` 可见性，默认 `private`：`private` 只服务拥有者名下的 Consumer，`public` 进入全站共享池。
 - Consumer 是下游 AI App 使用的凭据（`sk-*`，只在创建或轮换时展示一次）。
 - 逐调用审计：模型、Provider、音频秒数或合成字符数、费用、首字节与总延迟、错误码，以及可选的请求/响应诊断正文。
-- 语音计价：转写按音频秒数计费；合成按输出字符数或输入/输出 Token 数计费（随模型的计价方式）；价格表由管理员在「设置」中维护（种子价格从 Qwen 官方人民币价目按 7.2 汇率折算为美元纳元）。
+- 语音计价：转写按音频秒数计费；合成按输出字符数或输入/输出 Token 数计费（随模型的计价方式，与调用方式相互独立）；价格表由管理员在「设置」中维护（价格从 Qwen 官方人民币价目按 7.2 汇率折算为美元纳元）。
 - 请求费用查询：下游记录响应头 `x-qwen-lb-request-id` 后，可按单条或批量查询每次调用的实收金额与用量；支持上游网关（NormAI）通过 `x-normai-request-id` 传入统一请求 ID，跨上游的定价差异由各负载均衡器内部处理。
 - 控制台「语音工坊」：直接用登录身份试用一次转写或语音合成（`POST /api/transcriptions`、`POST /api/speech`），无需准备 Consumer 凭据。
 - Midas 预付费：用户向 fund 账户充值后即可调用；未充值且未开启欠费的请求返回 HTTP 402。
@@ -83,7 +83,19 @@ curl https://qwen.ntnl.io/v1/audio/speech \
   --output speech.wav
 ```
 
-`voice` 取值区分大小写，且必须属于所选模型支持的音色列表；跨模型使用音色会被上游以 InvalidParameter 拒绝。
+CosyVoice 系列（如 `cosyvoice-v3.5-flash`、`cosyvoice-v3.5-plus`）走「语音合成器」调用方式并按字符计费；注意 **cosyvoice-v3.5 系列不支持系统音色**，需先通过「声音复刻 / 声音设计」创建定制音色，`voice` 直接传该音色 ID（音色与目标模型绑定，不能跨模型使用）：
+
+```bash
+curl https://qwen.ntnl.io/v1/audio/speech \
+  -H 'Authorization: Bearer <YOUR_CONSUMER_KEY>' \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"你好，世界","model":"cosyvoice-v3.5-flash","voice":"cosyvoice-v3.5-flash-vd-<prefix>-<id>"}' \
+  --output speech.wav
+```
+
+定制音色在千问AI平台创建（声音复刻 / 声音设计），归创建它的账号所有。
+
+`voice` 取值区分大小写，且必须属于所选模型支持的音色列表；跨模型使用音色会被上游以 InvalidParameter 拒绝（`qwen-audio-3.1-tts-flash` 需 `_v3.1` 音色；CosyVoice v3.5 系列只接受其定制音色）。
 
 模型目录：
 
@@ -91,7 +103,7 @@ curl https://qwen.ntnl.io/v1/audio/speech \
 curl https://qwen.ntnl.io/v1/models -H 'Authorization: Bearer <YOUR_CONSUMER_KEY>'
 ```
 
-可调用的模型与单价由 root/admin 在「设置 → 转写模型 / 语音合成模型」中维护，默认 `qwen-audio-3.0-asr-flash`（30 556 纳美元/秒）与 `qwen3-tts-flash`（11 111 纳美元/字符）；语音合成模型按字符或按 Token 计价（`qwen-audio-3.1-tts-flash`：输入 208 333 333、输出 1 666 666 667 纳美元/百万 Token）；不在列表中的模型会在到达上游之前以 HTTP 400 拒绝。
+可调用的模型与单价由 root/admin 在「设置 → 转写模型 / 语音合成模型」中维护，默认 `qwen-audio-3.0-asr-flash`（30 556 纳美元/秒）与 `qwen3-tts-flash`（11 111 纳美元/字符，多模态生成）；语音合成模型可分别选择计价方式（按字符 / 按 Token）与调用方式（多模态生成 / 语音合成器），例如 `qwen-audio-3.1-tts-flash`（输入 208 333 333、输出 1 666 666 667 纳美元/百万 Token，语音合成器）与 `cosyvoice-v3.5-flash` / `cosyvoice-v3.5-plus`（11 111 / 20 833 纳美元/字符，语音合成器）；不在列表中的模型会在到达上游之前以 HTTP 400 拒绝。
 
 ## 请求费用查询
 

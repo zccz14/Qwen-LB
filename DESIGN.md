@@ -189,7 +189,7 @@ components:
 ### Inputs / Fields
 
 - **Style:** 36px 高、8px 圆角、Clean Canvas 背景和 Hairline Boundary 边界。
-- **Composition:** 表单使用 FieldGroup 与 Field；选项组使用 ToggleGroup 或 FieldSet，不手工拼装。
+- **Composition:** 表单使用 FieldGroup 与 Field；选项组使用 ToggleGroup 或 FieldSet，不手工拼装。语音模型行依次为模型、计价方式、调用方式与费率；计价方式与调用方式相互独立，切换其一不联动重算另一项。
 - **Focus:** 3px Focus Graphite 环，并保留可见边界。
 - **Error / Disabled:** `data-invalid` 与 `aria-invalid` 同步；错误包含明确修复建议，禁用状态说明原因。
 
