@@ -99,6 +99,16 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
+import {
+  Autocomplete,
+  AutocompleteContent,
+  AutocompleteEmpty,
+  AutocompleteInput,
+  AutocompleteInputGroup,
+  AutocompleteItem,
+  AutocompleteList,
+  AutocompleteTrigger,
+} from "@/components/ui/autocomplete"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -183,6 +193,9 @@ import {
   isLanguageHint,
   normalizeLanguageHint,
   speechRequest,
+  speechVoiceRequiresCustom,
+  speechVoiceSuggestions,
+  speechVoiceSurvivesModelChange,
   transcriptionForm,
 } from "@/lib/voice"
 
@@ -939,7 +952,12 @@ const copy = {
     "voiceCharacters": "字符",
     "voiceSpeechModelHelp": "选择语音合成模型；缺省使用设置中的默认模型。",
     "voiceVoice": "音色",
-    "voiceVoiceHelp": "缺省音色为 Cherry；也可填写其他 Qwen 音色名称。",
+    "voiceVoiceHelp": "从列表中选择系统音色，或直接输入完整音色 ID；音色必须属于所选模型。",
+    "voiceVoiceCustomHelp":
+      "CosyVoice v3.5 不支持系统音色，请填写声音复刻或声音设计生成、且绑定所选模型的音色 ID。",
+    "voiceVoiceCustomPlaceholder": "声音复刻/声音设计生成的音色 ID",
+    "voiceVoiceNoMatch": "没有匹配的系统音色，可直接输入完整音色 ID。",
+    "voiceVoiceBrowse": "浏览音色列表",
     "voiceSynthesizing": "正在合成…",
     "voiceSynthesizeRun": "开始合成",
     "voiceSpeechResult": "合成结果",
@@ -1403,7 +1421,13 @@ const copy = {
     "voiceCharacters": "characters",
     "voiceSpeechModelHelp": "Choose the speech model; the configured default is preselected.",
     "voiceVoice": "Voice",
-    "voiceVoiceHelp": "The default voice is Cherry; any other Qwen voice name works too.",
+    "voiceVoiceHelp":
+      "Pick a system voice from the list, or type a full voice ID; the voice must belong to the selected model.",
+    "voiceVoiceCustomHelp":
+      "CosyVoice v3.5 has no system voices; use a voice ID created for the selected model via voice cloning or voice design.",
+    "voiceVoiceCustomPlaceholder": "Voice ID from voice cloning or voice design",
+    "voiceVoiceNoMatch": "No matching system voice; the full voice ID you type is still used.",
+    "voiceVoiceBrowse": "Browse voices",
     "voiceSynthesizing": "Synthesizing…",
     "voiceSynthesizeRun": "Synthesize",
     "voiceSpeechResult": "Synthesized audio",
@@ -2351,8 +2375,19 @@ function SpeechTool({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   const [error, setError] = useState("")
   const [pending, setPending] = useState(false)
   const models = settings.data?.speech_models ?? []
+  const suggestions = speechVoiceSuggestions(model)
+  const voiceRequiresCustom = speechVoiceRequiresCustom(model)
+  const voicePlaceholder =
+    suggestions[0] ??
+    (voiceRequiresCustom ? t.voiceVoiceCustomPlaceholder : defaultSpeechVoice)
   useEffect(() => {
-    if (!model && settings.data) setModel(settings.data.default_speech_model)
+    if (!model && settings.data) {
+      const next = settings.data.default_speech_model
+      setModel(next)
+      setVoice((current) =>
+        speechVoiceSurvivesModelChange(current, next) ? current : ""
+      )
+    }
   }, [model, settings.data])
   useEffect(
     () => () => {
@@ -2408,7 +2443,13 @@ function SpeechTool({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
             <FieldLabel htmlFor="voice-speech-model">{t.model}</FieldLabel>
             <Select
               value={model}
-              onValueChange={(value) => value && setModel(value)}
+              onValueChange={(value) => {
+                if (!value) return
+                setModel(value)
+                setVoice((current) =>
+                  speechVoiceSurvivesModelChange(current, value) ? current : ""
+                )
+              }}
             >
               <SelectTrigger id="voice-speech-model">
                 <SelectValue />
@@ -2427,18 +2468,52 @@ function SpeechTool({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           </Field>
           <Field>
             <FieldLabel htmlFor="voice-speech-voice">{t.voiceVoice}</FieldLabel>
-            <Input
-              id="voice-speech-voice"
-              onChange={(event) => setVoice(event.target.value)}
-              placeholder={defaultSpeechVoice}
-              value={voice}
-            />
-            <FieldDescription>{t.voiceVoiceHelp}</FieldDescription>
+            {suggestions.length > 0 ? (
+              <Autocomplete
+                autoHighlight
+                items={suggestions}
+                onValueChange={(value) => setVoice(value ?? "")}
+                openOnInputClick
+                value={voice}
+              >
+                <AutocompleteInputGroup>
+                  <AutocompleteInput
+                    id="voice-speech-voice"
+                    placeholder={voicePlaceholder}
+                  />
+                  <AutocompleteTrigger aria-label={t.voiceVoiceBrowse} />
+                </AutocompleteInputGroup>
+                <AutocompleteContent>
+                  <AutocompleteEmpty>{t.voiceVoiceNoMatch}</AutocompleteEmpty>
+                  <AutocompleteList>
+                    {(voiceId: string) => (
+                      <AutocompleteItem key={voiceId} value={voiceId}>
+                        {voiceId}
+                      </AutocompleteItem>
+                    )}
+                  </AutocompleteList>
+                </AutocompleteContent>
+              </Autocomplete>
+            ) : (
+              <Input
+                id="voice-speech-voice"
+                onChange={(event) => setVoice(event.target.value)}
+                placeholder={voicePlaceholder}
+                value={voice}
+              />
+            )}
+            <FieldDescription>
+              {voiceRequiresCustom ? t.voiceVoiceCustomHelp : t.voiceVoiceHelp}
+            </FieldDescription>
           </Field>
         </div>
         <div>
           <Button
-            disabled={pending || !input.trim()}
+            disabled={
+              pending ||
+              !input.trim() ||
+              (voiceRequiresCustom && !voice.trim())
+            }
             onClick={() => void synthesize()}
           >
             {pending ? (
