@@ -93,3 +93,15 @@ test("shows the voice totals in the account overview", () => {
   assert.match(dashboard, /data\?\.speech_model_ids/)
   assert.doesNotMatch(dashboard, /peak_now|cacheHitRate/)
 })
+
+test("lets speech models choose their upstream surface", () => {
+  const settings = app.slice(
+    app.indexOf("function VoiceModelsSettings"),
+    app.indexOf("function MidasSettings")
+  )
+
+  assert.match(settings, /t\.speechSurfaceKind/)
+  assert.match(settings, /settings-\$\{kind\}-surface-\$\{index\}/)
+  assert.match(settings, /value === "speech_synthesizer"/)
+  assert.match(settings, /surface: row\.surface \?\? "multimodal"/)
+})

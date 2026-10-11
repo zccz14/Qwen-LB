@@ -450,6 +450,7 @@ type ProviderAuditResponse = {
 type TranscriptionModelRate = { model: string; price_usd_per_second: string }
 type SpeechModelRate = {
   model: string
+  surface?: string
   price_usd_per_character?: string
   price_usd_per_million_input_tokens?: string
   price_usd_per_million_output_tokens?: string
@@ -832,11 +833,15 @@ const copy = {
     "transcriptionModelsDescription": "下游可调用的转写模型与单价（USD / 秒）。",
     "transcriptionModelsUnit": "USD / 秒",
     "speechModels": "语音合成模型",
-    "speechModelsDescription": "下游可调用的合成模型与单价（USD / 字符或 USD / 百万 Token）。",
+    "speechModelsDescription": "下游可调用的合成模型、单价与调用方式（USD / 字符或 USD / 百万 Token）。",
     "speechModelsUnit": "USD / 字符",
     "speechPricingKind": "计价方式",
     "speechPricingCharacter": "按字符",
     "speechPricingToken": "按 Token",
+    "speechSurfaceKind": "调用方式",
+    "speechSurfaceMultimodal": "多模态生成",
+    "speechSurfaceSynthesizer": "语音合成器",
+    "speechSurfaceHelp": "按字符 + 多模态 = Qwen3-TTS；按字符 + 语音合成器 = CosyVoice 3.5 等；按 Token + 语音合成器 = Qwen-Audio 3.1。",
     "voiceTokenInput": "输入",
     "voiceTokenOutput": "输出",
     "voiceMillionTokenUnit": "百万 Token",
@@ -1292,11 +1297,15 @@ const copy = {
     "transcriptionModelsDescription": "Downstream-callable transcription models and their rate (USD per second).",
     "transcriptionModelsUnit": "USD / second",
     "speechModels": "Speech models",
-    "speechModelsDescription": "Downstream-callable speech models and their rate (USD per character or per million tokens).",
+    "speechModelsDescription": "Downstream-callable speech models, rates, and upstream surface (USD per character or per million tokens).",
     "speechModelsUnit": "USD / character",
     "speechPricingKind": "Pricing",
     "speechPricingCharacter": "Per character",
     "speechPricingToken": "Per token",
+    "speechSurfaceKind": "Surface",
+    "speechSurfaceMultimodal": "Multimodal",
+    "speechSurfaceSynthesizer": "Speech synthesizer",
+    "speechSurfaceHelp": "Per character + multimodal = Qwen3-TTS; per character + synthesizer = CosyVoice 3.5 and similar; per token + synthesizer = Qwen-Audio 3.1.",
     "voiceTokenInput": "Input",
     "voiceTokenOutput": "Output",
     "voiceMillionTokenUnit": "million tokens",
@@ -2668,6 +2677,8 @@ function VoicePricesPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                           {t.voiceMillionTokenUnit}
                         </>
                       )}
+                      {row.surface === "speech_synthesizer" &&
+                        ` · ${t.speechSurfaceSynthesizer}`}
                     </TableCell>
                   </TableRow>
                 ))}
@@ -5887,6 +5898,10 @@ function SettingsPage({
                 item.price_usd_per_character === undefined
                   ? ("token" as const)
                   : ("character" as const),
+              surface:
+                item.surface === "speech_synthesizer"
+                  ? ("speech_synthesizer" as const)
+                  : ("multimodal" as const),
               inputRate: item.price_usd_per_million_input_tokens ?? "",
               outputRate: item.price_usd_per_million_output_tokens ?? "",
             }))}
@@ -5988,6 +6003,7 @@ type VoiceModelDraft = {
   model: string
   rate: string
   pricing?: "character" | "token"
+  surface?: "multimodal" | "speech_synthesizer"
   inputRate?: string
   outputRate?: string
 }
@@ -6064,16 +6080,19 @@ function VoiceModelsSettings({
               model: row.model.trim(),
               ...(kind === "transcription"
                 ? { price_usd_per_second: row.rate.trim() }
-                : tokenRow(row)
-                  ? {
-                      price_usd_per_million_input_tokens: (
-                        row.inputRate ?? ""
-                      ).trim(),
-                      price_usd_per_million_output_tokens: (
-                        row.outputRate ?? ""
-                      ).trim(),
-                    }
-                  : { price_usd_per_character: row.rate.trim() }),
+                : {
+                    surface: row.surface ?? "multimodal",
+                    ...(tokenRow(row)
+                      ? {
+                          price_usd_per_million_input_tokens: (
+                            row.inputRate ?? ""
+                          ).trim(),
+                          price_usd_per_million_output_tokens: (
+                            row.outputRate ?? ""
+                          ).trim(),
+                        }
+                      : { price_usd_per_character: row.rate.trim() }),
+                  }),
             })),
             default_model: defaultValue,
           }),
@@ -6146,6 +6165,39 @@ function VoiceModelsSettings({
                         </SelectGroup>
                       </SelectContent>
                     </Select>
+                  </Field>
+                )}
+                {kind === "speech" && (
+                  <Field className="w-44">
+                    <FieldLabel htmlFor={`settings-${kind}-surface-${index}`}>
+                      {t.speechSurfaceKind}
+                    </FieldLabel>
+                    <Select
+                      value={row.surface ?? "multimodal"}
+                      onValueChange={(value) => {
+                        if (
+                          value === "multimodal" ||
+                          value === "speech_synthesizer"
+                        ) {
+                          updateRow(index, { surface: value })
+                        }
+                      }}
+                    >
+                      <SelectTrigger id={`settings-${kind}-surface-${index}`}>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectItem value="multimodal">
+                            {t.speechSurfaceMultimodal}
+                          </SelectItem>
+                          <SelectItem value="speech_synthesizer">
+                            {t.speechSurfaceSynthesizer}
+                          </SelectItem>
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                    <FieldDescription>{t.speechSurfaceHelp}</FieldDescription>
                   </Field>
                 )}
                 {tokenRow(row) ? (
@@ -6251,6 +6303,7 @@ function VoiceModelsSettings({
                       model: "",
                       rate: "",
                       pricing: "character",
+                      surface: "multimodal",
                       inputRate: "",
                       outputRate: "",
                     },
