@@ -52,6 +52,10 @@ pub struct AuditEvent {
     pub audio_seconds: f64,
     /// Characters synthesized, as the upstream reported them.
     pub characters: i64,
+    /// Input tokens of token-priced synthesis, as the upstream reported them.
+    pub input_tokens: i64,
+    /// Output tokens of token-priced synthesis, as the upstream reported them.
+    pub output_tokens: i64,
     pub cost_usd_nanos: i64,
     pub error: Option<String>,
     pub error_code: Option<String>,
@@ -273,12 +277,12 @@ async fn insert(
             .await?;
 
     sqlx::query(
-        "INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,status,first_byte_latency_ms,request_bytes,response_bytes,request_transport_bytes,response_transport_bytes,downstream_accept_encoding,downstream_content_encoding,upstream_accept_encoding,upstream_content_encoding,latency_ms,audio_seconds,characters,cost_usd_nanos,consumed_usd_before_nanos,consumed_usd_after_nanos,provided_usd_before_nanos,provided_usd_after_nanos,error,client_ip,created_at,upstream_http_version,error_code) VALUES(
+        "INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,status,first_byte_latency_ms,request_bytes,response_bytes,request_transport_bytes,response_transport_bytes,downstream_accept_encoding,downstream_content_encoding,upstream_accept_encoding,upstream_content_encoding,latency_ms,audio_seconds,characters,input_tokens,output_tokens,cost_usd_nanos,consumed_usd_before_nanos,consumed_usd_after_nanos,provided_usd_before_nanos,provided_usd_after_nanos,error,client_ip,created_at,upstream_http_version,error_code) VALUES(
             ?,?,?,?,?,
             (SELECT id FROM providers WHERE id=?),
             ?,?,?,?,?,?,?,
             ?,?,?,?,?,?,?,
-            ?,?,?,?,?,?,?,
+            ?,?,?,?,?,?,?,?,?,
             ?,?,?,?,?,?,?
         )",
     )
@@ -306,6 +310,8 @@ async fn insert(
         .bind(event.latency_ms)
         .bind(event.audio_seconds)
         .bind(event.characters)
+        .bind(event.input_tokens)
+        .bind(event.output_tokens)
         .bind(cost_usd_nanos)
         .bind(consumed_usd_before_nanos)
         .bind(consumed_usd_after_nanos)
@@ -440,6 +446,8 @@ mod tests {
             latency_ms: 1,
             audio_seconds: 1.5,
             characters: 0,
+            input_tokens: 0,
+            output_tokens: 0,
             cost_usd_nanos,
             error: None,
             error_code: None,

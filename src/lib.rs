@@ -534,7 +534,9 @@ pub(crate) async fn test_state(upstream_base: &str) -> AppState {
         default_transcription_model: config::DEFAULT_TRANSCRIPTION_MODEL.to_owned(),
         speech_models: vec![config::SpeechModel {
             model: config::DEFAULT_SPEECH_MODEL.to_owned(),
-            price_usd_nanos_per_character: 11111,
+            pricing: config::SpeechPricing::PerCharacter {
+                price_usd_nanos_per_character: 11111,
+            },
         }],
         default_speech_model: config::DEFAULT_SPEECH_MODEL.to_owned(),
         allow_all_users_debt: false,

@@ -38,6 +38,8 @@ Authorization: Bearer <CONSUMER_KEY>
   "model": "qwen-audio-3.0-asr-flash",
   "audio_seconds": 2.5,
   "characters": 0,
+  "input_tokens": 0,
+  "output_tokens": 0,
   "cost_usd_nanos": 76390,
   "created_at": 1759360000
 }
@@ -65,7 +67,7 @@ Content-Type: application/json
 {
   "requests": [
     {"request_id": "0f10ab1c-…", "status": 200, "model": "qwen3-tts-flash",
-     "audio_seconds": 0.0, "characters": 7,
+     "audio_seconds": 0.0, "characters": 7, "input_tokens": 0, "output_tokens": 0,
      "cost_usd_nanos": 77777, "created_at": 1759360000}
   ],
   "missing": ["4eef28a0-…"]
@@ -112,11 +114,14 @@ loop, every N minutes or once pending is large enough:
 | `model` | requested model; `null` when the request failed before parsing |
 | `audio_seconds` | transcribed audio seconds as the upstream reported them (0 for synthesis) |
 | `characters` | synthesized output characters as the upstream reported them (0 for transcription) |
+| `input_tokens` | input tokens of token-priced speech synthesis as the upstream reported them (0 otherwise) |
+| `output_tokens` | output tokens of token-priced speech synthesis as the upstream reported them (0 otherwise) |
 | `cost_usd_nanos` | the amount charged, in USD nanodollars (1e-9 USD) |
 | `created_at` | request start time, Unix seconds |
 
 `cost_usd_nanos` is computed when the upstream reply settles — audio seconds ×
-the transcription rate, or characters × the speech rate, using the rates
+the transcription rate, characters × the per-character speech rate, or
+input/output tokens × the per-million-token speech rates, using the rates
 active at billing time — and is the same value the console audit shows and
 that user consumption accounting uses. It is read from the ledger at query
 time, never recomputed.

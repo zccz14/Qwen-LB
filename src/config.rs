@@ -28,11 +28,30 @@ pub struct TranscriptionModel {
     pub price_usd_nanos_per_second: i64,
 }
 
-/// One speech-synthesis model plus the rate it bills at (per output character).
+/// One speech-synthesis model plus the rate it bills at.
+///
+/// The pricing unit selects the upstream surface: a per-character model bills
+/// from the multimodal-generation response (`usage.characters`), while a
+/// per-token model bills from the SpeechSynthesizer response
+/// (`usage.input_tokens` / `usage.output_tokens`), which only the
+/// non-real-time speech-synthesis surface produces.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpeechModel {
     pub model: String,
-    pub price_usd_nanos_per_character: i64,
+    pub pricing: SpeechPricing,
+}
+
+/// The rate one speech model bills at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SpeechPricing {
+    /// Nanodollars per synthesized output character.
+    PerCharacter { price_usd_nanos_per_character: i64 },
+    /// Nanodollars per million tokens, input and output, as the
+    /// speech-synthesis surface reports them.
+    PerToken {
+        price_usd_nanos_per_million_input_tokens: i64,
+        price_usd_nanos_per_million_output_tokens: i64,
+    },
 }
 
 /// Validates a model ID the same way whether it comes from the seed migration,
@@ -96,6 +115,39 @@ pub fn normalize_transcription_models(
     Ok(normalized)
 }
 
+/// Reads one speech model's rate: either a per-character rate or the
+/// per-million-token input and output rates, never a mix.
+fn parse_speech_pricing(item: &serde_json::Value) -> Result<SpeechPricing, String> {
+    let character = item.get("price_usd_nanos_per_character");
+    let input = item.get("price_usd_nanos_per_million_input_tokens");
+    let output = item.get("price_usd_nanos_per_million_output_tokens");
+    match (character, input, output) {
+        (Some(character), None, None) => Ok(SpeechPricing::PerCharacter {
+            price_usd_nanos_per_character: parse_positive(
+                character,
+                "price_usd_nanos_per_character",
+                1_000_000,
+            )?,
+        }),
+        (None, Some(input), Some(output)) => Ok(SpeechPricing::PerToken {
+            price_usd_nanos_per_million_input_tokens: parse_positive(
+                input,
+                "price_usd_nanos_per_million_input_tokens",
+                100_000_000_000,
+            )?,
+            price_usd_nanos_per_million_output_tokens: parse_positive(
+                output,
+                "price_usd_nanos_per_million_output_tokens",
+                100_000_000_000,
+            )?,
+        }),
+        _ => Err(
+            "each speech model needs either a per-character rate or both per-million-token rates"
+                .to_owned(),
+        ),
+    }
+}
+
 pub fn normalize_speech_models(value: serde_json::Value) -> Result<Vec<SpeechModel>, String> {
     let items = value
         .as_array()
@@ -111,19 +163,11 @@ pub fn normalize_speech_models(value: serde_json::Value) -> Result<Vec<SpeechMod
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| "each speech model needs a model ID".to_owned())?,
         )?;
-        let price_usd_nanos_per_character = parse_positive(
-            item.get("price_usd_nanos_per_character")
-                .ok_or_else(|| "each speech model needs a price".to_owned())?,
-            "price_usd_nanos_per_character",
-            1_000_000,
-        )?;
+        let pricing = parse_speech_pricing(item)?;
         if !unique.insert(model.clone()) {
             return Err(format!("duplicate speech model: {model}"));
         }
-        normalized.push(SpeechModel {
-            model,
-            price_usd_nanos_per_character,
-        });
+        normalized.push(SpeechModel { model, pricing });
     }
     Ok(normalized)
 }
@@ -268,11 +312,11 @@ impl Config {
             .map(|item| item.price_usd_nanos_per_second)
     }
 
-    pub fn speech_price_per_character(&self, model: &str) -> Option<i64> {
+    pub fn speech_pricing(&self, model: &str) -> Option<SpeechPricing> {
         self.speech_models
             .iter()
             .find(|item| item.model == model)
-            .map(|item| item.price_usd_nanos_per_character)
+            .map(|item| item.pricing)
     }
 }
 
@@ -322,11 +366,7 @@ mod tests {
                 .is_some()
         );
         assert_eq!(config.default_speech_model, DEFAULT_SPEECH_MODEL);
-        assert!(
-            config
-                .speech_price_per_character(DEFAULT_SPEECH_MODEL)
-                .is_some()
-        );
+        assert!(config.speech_pricing(DEFAULT_SPEECH_MODEL).is_some());
         assert_eq!(config.upstream_base, DEFAULT_UPSTREAM_BASE);
     }
 
@@ -355,11 +395,40 @@ mod tests {
     #[test]
     fn speech_models_are_validated() {
         let ok = normalize_speech_models(serde_json::json!([
-            {"model": "qwen3-tts-flash", "price_usd_nanos_per_character": 11111}
+            {"model": "qwen3-tts-flash", "price_usd_nanos_per_character": 11111},
+            {"model": "qwen-audio-3.1-tts-flash",
+             "price_usd_nanos_per_million_input_tokens": 208333333,
+             "price_usd_nanos_per_million_output_tokens": 1666666667}
         ]))
         .unwrap();
-        assert_eq!(ok[0].price_usd_nanos_per_character, 11111);
+        assert_eq!(
+            ok[0].pricing,
+            SpeechPricing::PerCharacter {
+                price_usd_nanos_per_character: 11111
+            }
+        );
+        assert_eq!(
+            ok[1].pricing,
+            SpeechPricing::PerToken {
+                price_usd_nanos_per_million_input_tokens: 208_333_333,
+                price_usd_nanos_per_million_output_tokens: 1_666_666_667,
+            }
+        );
         assert!(normalize_speech_models(serde_json::json!([])).is_err());
+        assert!(
+            normalize_speech_models(serde_json::json!([
+                {"model": "x", "price_usd_nanos_per_character": 1,
+                 "price_usd_nanos_per_million_input_tokens": 1,
+                 "price_usd_nanos_per_million_output_tokens": 1}
+            ]))
+            .is_err()
+        );
+        assert!(
+            normalize_speech_models(serde_json::json!([
+                {"model": "x", "price_usd_nanos_per_million_input_tokens": 1}
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
