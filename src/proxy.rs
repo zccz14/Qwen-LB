@@ -22,14 +22,21 @@ use crate::{
     audit::{ARCHIVE_BODY_LIMIT, AuditEvent, AuditReservation},
     auth::{ApiIdentity, UserIdentity, api_identity},
     balancer::{Downstream, Lease, affinity_hash, track_response},
+    config::SpeechPricing,
     crypto::consumer_secret_hash,
     midas,
 };
 
-/// Everything below the two voice endpoints speaks this one upstream surface:
-/// a single JSON POST that either transcribes an audio to text or synthesizes
-/// text to audio, exactly as the Qwen platform documents it.
+/// The multimodal-generation surface: one JSON POST that transcribes an
+/// audio to text, and synthesizes the character-priced speech models, exactly
+/// as the Qwen platform documents it.
 const GENERATION_PATH: &str = "/api/v1/services/aigc/multimodal-generation/generation";
+
+/// The non-real-time speech-synthesis surface (Qwen-Audio-TTS) that the
+/// token-priced speech models such as `qwen-audio-3.1-tts-flash` are billed
+/// through; `usage.input_tokens` / `usage.output_tokens` from this response
+/// are the billing basis.
+const SPEECH_SYNTHESIZER_PATH: &str = "/api/v1/services/audio/tts/SpeechSynthesizer";
 
 pub(crate) const TRANSCRIPTION_PATH: &str = "/v1/audio/transcriptions";
 pub(crate) const SPEECH_PATH: &str = "/v1/audio/speech";
@@ -121,6 +128,8 @@ impl UpstreamResponse {
 struct AudioUsage {
     audio_seconds: f64,
     characters: i64,
+    input_tokens: i64,
+    output_tokens: i64,
     cost_usd_nanos: i64,
 }
 
@@ -176,6 +185,8 @@ impl AuditTracker {
             latency_ms: 0,
             audio_seconds: 0.0,
             characters: 0,
+            input_tokens: 0,
+            output_tokens: 0,
             cost_usd_nanos: 0,
             error: None,
             error_code: None,
@@ -393,6 +404,8 @@ fn settle(
     event.latency_ms = started.elapsed().as_millis().max(1) as i64;
     event.audio_seconds = usage.audio_seconds;
     event.characters = usage.characters;
+    event.input_tokens = usage.input_tokens;
+    event.output_tokens = usage.output_tokens;
     event.cost_usd_nanos = usage.cost_usd_nanos.max(0);
     if event.error.is_none() {
         event.error = error.map(str::to_owned);
@@ -563,6 +576,35 @@ fn build_transcription_body(
     .expect("transcription request body is serializable")
 }
 
+/// Builds the upstream speech request: the multimodal-generation surface for
+/// per-character pricing, or the non-real-time speech-synthesis surface (WAV
+/// at 24 kHz) for per-token pricing.
+fn speech_upstream_request(
+    model: &str,
+    input: &str,
+    voice: &str,
+    pricing: SpeechPricing,
+) -> (&'static str, Value) {
+    match pricing {
+        SpeechPricing::PerCharacter { .. } => (
+            GENERATION_PATH,
+            json!({"model": model, "input": {"text": input, "voice": voice}}),
+        ),
+        SpeechPricing::PerToken { .. } => (
+            SPEECH_SYNTHESIZER_PATH,
+            json!({
+                "model": model,
+                "input": {
+                    "text": input,
+                    "voice": voice,
+                    "format": "wav",
+                    "sample_rate": 24000
+                }
+            }),
+        ),
+    }
+}
+
 pub async fn handle_transcription(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -674,6 +716,7 @@ async fn dispatch_transcription(
             &mut audit,
             affinity.as_deref(),
             downstream,
+            GENERATION_PATH,
             body.into(),
         )
         .await?;
@@ -785,8 +828,8 @@ async fn dispatch_speech(
             .filter(|model| !model.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| config.default_speech_model.clone());
-        let price_usd_nanos_per_character = config
-            .speech_price_per_character(&model)
+        let pricing = config
+            .speech_pricing(&model)
             .ok_or_else(|| AppError::bad_request(format!("model is not available: {model}")))?;
         let voice = value
             .get("voice")
@@ -797,16 +840,16 @@ async fn dispatch_speech(
             .to_owned();
         audit.set_requested_model(Some(&model));
         ensure_request_quota(&state, &identity.user_id, identity.allow_debt).await?;
-        let upstream_body = serde_json::to_vec(&json!({
-            "model": model,
-            "input": {"text": input, "voice": voice},
-        }))?;
+        let (upstream_path, upstream_body) =
+            speech_upstream_request(&model, &input, &voice, pricing);
+        let upstream_body = serde_json::to_vec(&upstream_body)?;
         let downstream = Downstream::new(&identity.user_id);
         let routed = route_upstream(
             &state,
             &mut audit,
             affinity.as_deref(),
             downstream,
+            upstream_path,
             upstream_body.into(),
         )
         .await?;
@@ -815,7 +858,7 @@ async fn dispatch_speech(
             routed.lease,
             routed.upstream,
             &model,
-            price_usd_nanos_per_character,
+            pricing,
             &mut audit,
         )
         .await
@@ -880,7 +923,7 @@ pub async fn handle_models(
 
 /// Column set shared by both query shapes; the response field names are fixed
 /// by [`request_record_json`].
-const REQUEST_RECORD_SELECT: &str = "SELECT request_id,status,model,audio_seconds,characters,cost_usd_nanos,created_at FROM api_calls";
+const REQUEST_RECORD_SELECT: &str = "SELECT request_id,status,model,audio_seconds,characters,input_tokens,output_tokens,cost_usd_nanos,created_at FROM api_calls";
 
 fn request_record_json(row: &sqlx::sqlite::SqliteRow) -> Value {
     json!({
@@ -889,6 +932,8 @@ fn request_record_json(row: &sqlx::sqlite::SqliteRow) -> Value {
         "model": row.get::<Option<String>, _>("model"),
         "audio_seconds": row.get::<f64, _>("audio_seconds"),
         "characters": row.get::<i64, _>("characters"),
+        "input_tokens": row.get::<i64, _>("input_tokens"),
+        "output_tokens": row.get::<i64, _>("output_tokens"),
         "cost_usd_nanos": row.get::<i64, _>("cost_usd_nanos"),
         "created_at": row.get::<i64, _>("created_at"),
     })
@@ -1047,6 +1092,7 @@ async fn route_upstream(
     audit: &mut AuditTracker,
     affinity: Option<&str>,
     downstream: Downstream<'_>,
+    path: &'static str,
     body: Bytes,
 ) -> Result<RoutedUpstream, AppError> {
     let mut first = state
@@ -1055,7 +1101,7 @@ async fn route_upstream(
         .await?;
     audit.set_provider(&first);
     let first_id = first.provider.id.clone();
-    let response = send_upstream(state, &first, body.clone().into(), audit).await?;
+    let response = send_upstream(state, &first, path, body.clone().into(), audit).await?;
     let response = track_upstream(state, &first_id, UpstreamResponse::Live(response)).await?;
     if !retryable(response.status()) {
         return Ok(RoutedUpstream {
@@ -1078,7 +1124,7 @@ async fn route_upstream(
     drop(response);
     drop(first);
     audit.set_provider(&second);
-    let second_response = send_upstream(state, &second, body.into(), audit).await?;
+    let second_response = send_upstream(state, &second, path, body.into(), audit).await?;
     let second_response = track_upstream(
         state,
         &second.provider.id,
@@ -1138,16 +1184,13 @@ fn affinity_key(headers: &HeaderMap) -> Option<AffinityKey> {
 async fn send_upstream(
     state: &AppState,
     lease: &Lease,
+    path: &'static str,
     body: reqwest::Body,
     audit: &mut AuditTracker,
 ) -> Result<reqwest::Response, AppError> {
     let request = state
         .client
-        .post(format!(
-            "{}{}",
-            state.config.load().upstream_base,
-            GENERATION_PATH
-        ))
+        .post(format!("{}{}", state.config.load().upstream_base, path))
         .header(header::AUTHORIZATION, format!("Bearer {}", lease.api_key))
         .header(header::CONTENT_TYPE, "application/json")
         .body(body)
@@ -1241,6 +1284,8 @@ async fn relay_transcription(
         AudioUsage {
             audio_seconds,
             characters: 0,
+            input_tokens: 0,
+            output_tokens: 0,
             cost_usd_nanos,
         },
         None,
@@ -1252,12 +1297,60 @@ async fn relay_transcription(
     Ok(response)
 }
 
+/// Reads one speech response's billable usage. A per-character model bills
+/// from `usage.characters`; a per-token model bills from the input/output
+/// token counts, which the speech-synthesis response reports for it.
+fn speech_usage(value: &Value, pricing: SpeechPricing) -> Result<AudioUsage, AppError> {
+    match pricing {
+        SpeechPricing::PerCharacter {
+            price_usd_nanos_per_character,
+        } => {
+            let characters = value
+                .pointer("/usage/characters")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            Ok(AudioUsage {
+                audio_seconds: 0.0,
+                characters,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd_nanos: price_usd_nanos_per_character.saturating_mul(characters),
+            })
+        }
+        SpeechPricing::PerToken {
+            price_usd_nanos_per_million_input_tokens,
+            price_usd_nanos_per_million_output_tokens,
+        } => {
+            let input_tokens = value
+                .pointer("/usage/input_tokens")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| AppError::upstream(502, "speech response is missing token usage"))?;
+            let output_tokens = value
+                .pointer("/usage/output_tokens")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| AppError::upstream(502, "speech response is missing token usage"))?;
+            let cost_usd_nanos = ((input_tokens as f64
+                * price_usd_nanos_per_million_input_tokens as f64
+                + output_tokens as f64 * price_usd_nanos_per_million_output_tokens as f64)
+                / 1_000_000.0)
+                .round() as i64;
+            Ok(AudioUsage {
+                audio_seconds: 0.0,
+                characters: 0,
+                input_tokens,
+                output_tokens,
+                cost_usd_nanos,
+            })
+        }
+    }
+}
+
 async fn relay_speech(
     state: &AppState,
     _lease: Lease,
     upstream: UpstreamResponse,
     model: &str,
-    price_usd_nanos_per_character: i64,
+    pricing: SpeechPricing,
     audit: &mut AuditTracker,
 ) -> Result<Response, AppError> {
     audit.mark_first_byte();
@@ -1288,11 +1381,7 @@ async fn relay_speech(
         .and_then(Value::as_str)
         .filter(|url| !url.is_empty())
         .ok_or_else(|| AppError::upstream(502, "speech response is missing audio"))?;
-    let characters = value
-        .pointer("/usage/characters")
-        .and_then(Value::as_i64)
-        .unwrap_or_default();
-    let cost_usd_nanos = price_usd_nanos_per_character.saturating_mul(characters);
+    let usage = speech_usage(&value, pricing)?;
     let audio = state
         .client
         .get(audio_url)
@@ -1318,16 +1407,7 @@ async fn relay_speech(
         .map_err(|_| AppError::upstream(502, "failed to read synthesized audio"))?;
     audit.set_response_size(audio_bytes.len() as i64);
     audit.set_response_body(&audio_bytes, false);
-    let audit_id = audit.finish(
-        StatusCode::OK,
-        Some(model),
-        AudioUsage {
-            audio_seconds: 0.0,
-            characters,
-            cost_usd_nanos,
-        },
-        None,
-    );
+    let audit_id = audit.finish(StatusCode::OK, Some(model), usage, None);
     let mut response = build_response(
         StatusCode::OK,
         vec![(
@@ -1504,21 +1584,40 @@ mod tests {
         model: Option<String>,
         audio_seconds: f64,
         characters: i64,
+        input_tokens: i64,
+        output_tokens: i64,
         cost_usd_nanos: i64,
     }
 
     /// The audit writer persists batches asynchronously; poll for the settled row.
     async fn wait_for_call(state: &AppState, request_id: &str) -> SettledCall {
         for _ in 0..500 {
-            let row = sqlx::query_as::<_, (Option<String>, i64, Option<String>, f64, i64, i64)>(
-                "SELECT provider_id,status,model,audio_seconds,characters,cost_usd_nanos FROM api_calls WHERE request_id=?",
+            let row = sqlx::query_as::<_, (
+                Option<String>,
+                i64,
+                Option<String>,
+                f64,
+                i64,
+                i64,
+                i64,
+                i64,
+            )>(
+                "SELECT provider_id,status,model,audio_seconds,characters,input_tokens,output_tokens,cost_usd_nanos FROM api_calls WHERE request_id=?",
             )
             .bind(request_id)
             .fetch_optional(&state.db)
             .await
             .unwrap();
-            if let Some((provider_id, status, model, audio_seconds, characters, cost_usd_nanos)) =
-                row
+            if let Some((
+                provider_id,
+                status,
+                model,
+                audio_seconds,
+                characters,
+                input_tokens,
+                output_tokens,
+                cost_usd_nanos,
+            )) = row
             {
                 return SettledCall {
                     provider_id,
@@ -1526,6 +1625,8 @@ mod tests {
                     model,
                     audio_seconds,
                     characters,
+                    input_tokens,
+                    output_tokens,
                     cost_usd_nanos,
                 };
             }
@@ -1742,6 +1843,104 @@ mod tests {
         assert_eq!(call.characters, 7);
         assert_eq!(call.cost_usd_nanos, 11_111 * 7);
         assert_eq!(call.model.as_deref(), Some("qwen3-tts-flash"));
+    }
+
+    #[tokio::test]
+    async fn token_priced_speech_bills_from_the_synthesizer_surface() {
+        let audio: Vec<u8> = vec![0x52, 0x49, 0x46, 0x46, 0xaa, 0xbb, 0xcc, 0xdd];
+        let seen: Arc<Mutex<Option<UpstreamRequest>>> = Arc::default();
+        let seen_upstream = seen.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let base = format!("http://{addr}");
+        let audio_base = base.clone();
+        let audio_route = audio.clone();
+        let upstream = Router::new()
+            .route(
+                SPEECH_SYNTHESIZER_PATH,
+                post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                    let seen = seen_upstream.clone();
+                    let base = audio_base.clone();
+                    async move {
+                        let authorization = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        let value = serde_json::from_slice(&body).unwrap();
+                        *seen.lock().await = Some(UpstreamRequest {
+                            authorization,
+                            body: value,
+                        });
+                        Json(json!({
+                            "output": {"audio": {"url": format!("{base}/audio.wav")}},
+                            "usage": {"input_tokens": 28, "output_tokens": 62, "total_tokens": 90},
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/audio.wav",
+                get(move || {
+                    let audio = audio_route.clone();
+                    async move { ([(header::CONTENT_TYPE, "audio/wav")], audio) }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state = crate::test_state(&base).await;
+        seed_consumer_and_owner(&state, "user").await;
+        seed_provider(&state, "provider", "sk-provider", "user").await;
+        let mut config = (**state.config.load()).clone();
+        config.speech_models.push(crate::config::SpeechModel {
+            model: "qwen-audio-3.1-tts-flash".to_owned(),
+            pricing: SpeechPricing::PerToken {
+                price_usd_nanos_per_million_input_tokens: 208_333_333,
+                price_usd_nanos_per_million_output_tokens: 1_666_666_667,
+            },
+        });
+        state.config.store(std::sync::Arc::new(config));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header(header::AUTHORIZATION, format!("Bearer {CONSUMER_SECRET}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-normai-request-id", "req-integration-3")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "input": "这是一条测试语音。",
+                    "model": "qwen-audio-3.1-tts-flash",
+                    "voice": "longanhuan_v3.1",
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = send(state.clone(), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), audio.as_slice());
+
+        let upstream_request = seen.lock().await.clone().unwrap();
+        assert_eq!(
+            upstream_request.authorization.as_deref(),
+            Some("Bearer sk-provider")
+        );
+        assert_eq!(upstream_request.body["model"], "qwen-audio-3.1-tts-flash");
+        assert_eq!(upstream_request.body["input"]["text"], "这是一条测试语音。");
+        assert_eq!(upstream_request.body["input"]["voice"], "longanhuan_v3.1");
+        assert_eq!(upstream_request.body["input"]["format"], "wav");
+        assert_eq!(upstream_request.body["input"]["sample_rate"], 24000);
+
+        let call = wait_for_call(&state, "req-integration-3").await;
+        assert_eq!(call.status, 200);
+        assert_eq!(call.model.as_deref(), Some("qwen-audio-3.1-tts-flash"));
+        assert_eq!(call.characters, 0);
+        assert_eq!(call.input_tokens, 28);
+        assert_eq!(call.output_tokens, 62);
+        // 28 * 208333333 + 62 * 1666666667 = 109166666678 nanodollars per million tokens.
+        assert_eq!(call.cost_usd_nanos, 109_167);
     }
 
     #[tokio::test]

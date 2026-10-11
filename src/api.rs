@@ -68,20 +68,31 @@ pub async fn payment_summary(
     })))
 }
 
-/// The voice price table the console renders: per-second transcription rates
-/// and per-character speech rates, formatted as exact USD strings.
+/// The voice price table the console renders: per-second transcription rates,
+/// per-character speech rates, and per-million-token speech rates, formatted
+/// as exact USD strings.
 pub async fn audio_prices(State(state): State<AppState>) -> Json<Value> {
     let config = state.config.load();
     Json(json!({
-        "unit": "USD per second / USD per character",
+        "unit": "USD per second / USD per character / USD per million tokens",
         "transcription": config.transcription_models.iter().map(|item| json!({
             "model": item.model,
             "price_usd_per_second": payments::format_usd_nanos(item.price_usd_nanos_per_second),
         })).collect::<Vec<_>>(),
-        "speech": config.speech_models.iter().map(|item| json!({
-            "model": item.model,
-            "price_usd_per_character": payments::format_usd_nanos(item.price_usd_nanos_per_character),
-        })).collect::<Vec<_>>(),
+        "speech": config.speech_models.iter().map(|item| match item.pricing {
+            config::SpeechPricing::PerCharacter { price_usd_nanos_per_character } => json!({
+                "model": item.model,
+                "price_usd_per_character": payments::format_usd_nanos(price_usd_nanos_per_character),
+            }),
+            config::SpeechPricing::PerToken {
+                price_usd_nanos_per_million_input_tokens,
+                price_usd_nanos_per_million_output_tokens,
+            } => json!({
+                "model": item.model,
+                "price_usd_per_million_input_tokens": payments::format_usd_nanos(price_usd_nanos_per_million_input_tokens),
+                "price_usd_per_million_output_tokens": payments::format_usd_nanos(price_usd_nanos_per_million_output_tokens),
+            }),
+        }).collect::<Vec<_>>(),
     }))
 }
 
@@ -1169,7 +1180,7 @@ pub async fn audit_detail(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let admin = is_admin(&user);
-    let columns = "c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,p.name,c.method,c.path,c.model,c.status,c.latency_ms,c.audio_seconds,c.characters,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.downstream_accept_encoding,c.downstream_content_encoding,c.upstream_accept_encoding,c.upstream_content_encoding,a.upstream_request_headers_json,a.downstream_response_headers_json,c.upstream_http_version,c.cost_usd_nanos,c.consumed_usd_before_nanos,c.consumed_usd_after_nanos,c.provided_usd_before_nanos,c.provided_usd_after_nanos,COALESCE(a.bodies_deleted,0),c.error_code";
+    let columns = "c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,p.name,c.method,c.path,c.model,c.status,c.latency_ms,c.audio_seconds,c.characters,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.downstream_accept_encoding,c.downstream_content_encoding,c.upstream_accept_encoding,c.upstream_content_encoding,a.upstream_request_headers_json,a.downstream_response_headers_json,c.upstream_http_version,c.cost_usd_nanos,c.consumed_usd_before_nanos,c.consumed_usd_after_nanos,c.provided_usd_before_nanos,c.provided_usd_after_nanos,COALESCE(a.bodies_deleted,0),c.error_code,c.input_tokens,c.output_tokens";
     let from = " FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers p ON p.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?";
     let (sql, scope) = if admin {
         (format!("SELECT {columns}{from}"), None)
@@ -1247,6 +1258,8 @@ pub async fn audit_detail(
         "latency_ms":row.get::<i64,_>(11),
         "audio_seconds":row.get::<f64,_>(12),
         "characters":row.get::<i64,_>(13),
+        "input_tokens":row.get::<i64,_>(46),
+        "output_tokens":row.get::<i64,_>(47),
         "error":row.get::<Option<String>,_>(14),
         "client_ip":row.get::<Option<String>,_>(15),
         "affinity_hash":row.get::<Option<String>,_>(16),
@@ -1449,10 +1462,20 @@ pub async fn settings(
             "price_usd_per_second": payments::format_usd_nanos(item.price_usd_nanos_per_second),
         })).collect::<Vec<_>>(),
         "default_transcription_model":config.default_transcription_model,
-        "speech_models":config.speech_models.iter().map(|item| json!({
-            "model": item.model,
-            "price_usd_per_character": payments::format_usd_nanos(item.price_usd_nanos_per_character),
-        })).collect::<Vec<_>>(),
+        "speech_models":config.speech_models.iter().map(|item| match item.pricing {
+            config::SpeechPricing::PerCharacter { price_usd_nanos_per_character } => json!({
+                "model": item.model,
+                "price_usd_per_character": payments::format_usd_nanos(price_usd_nanos_per_character),
+            }),
+            config::SpeechPricing::PerToken {
+                price_usd_nanos_per_million_input_tokens,
+                price_usd_nanos_per_million_output_tokens,
+            } => json!({
+                "model": item.model,
+                "price_usd_per_million_input_tokens": payments::format_usd_nanos(price_usd_nanos_per_million_input_tokens),
+                "price_usd_per_million_output_tokens": payments::format_usd_nanos(price_usd_nanos_per_million_output_tokens),
+            }),
+        }).collect::<Vec<_>>(),
         "default_speech_model":config.default_speech_model,
         "allow_all_users_debt":config.allow_all_users_debt,
         "response_body_limit":config.response_body_limit,
@@ -1593,7 +1616,9 @@ pub struct UpdateSpeechModels {
 #[derive(Deserialize)]
 pub struct SpeechModelInput {
     model: String,
-    price_usd_per_character: String,
+    price_usd_per_character: Option<String>,
+    price_usd_per_million_input_tokens: Option<String>,
+    price_usd_per_million_output_tokens: Option<String>,
 }
 
 pub async fn update_speech_models(
@@ -1604,14 +1629,40 @@ pub async fn update_speech_models(
 ) -> Result<Json<Value>, AppError> {
     require_admin(&user)?;
     let models_json = voice_models_json(&input.models, |input| {
-        Ok(json!({
-            "model": input.model,
-            "price_usd_nanos_per_character": payments::parse_rate_usd_nanos(
+        Ok(
+            match (
                 &input.price_usd_per_character,
-                "price_usd_per_character",
-                1_000_000,
-            )?,
-        }))
+                &input.price_usd_per_million_input_tokens,
+                &input.price_usd_per_million_output_tokens,
+            ) {
+                (Some(rate), None, None) => json!({
+                    "model": input.model,
+                    "price_usd_nanos_per_character": payments::parse_rate_usd_nanos(
+                        rate,
+                        "price_usd_per_character",
+                        1_000_000,
+                    )?,
+                }),
+                (None, Some(input_rate), Some(output_rate)) => json!({
+                    "model": input.model,
+                    "price_usd_nanos_per_million_input_tokens": payments::parse_rate_usd_nanos(
+                        input_rate,
+                        "price_usd_per_million_input_tokens",
+                        100_000_000_000,
+                    )?,
+                    "price_usd_nanos_per_million_output_tokens": payments::parse_rate_usd_nanos(
+                        output_rate,
+                        "price_usd_per_million_output_tokens",
+                        100_000_000_000,
+                    )?,
+                }),
+                _ => {
+                    return Err(AppError::bad_request(
+                        "each speech model needs either a per-character rate or per-million-token input and output rates",
+                    ));
+                }
+            },
+        )
     })?;
     let models = config::normalize_speech_models(models_json).map_err(AppError::bad_request)?;
     let default_model =
@@ -1619,11 +1670,19 @@ pub async fn update_speech_models(
     let value = serde_json::to_string(
         &models
             .iter()
-            .map(|item| {
-                json!({
+            .map(|item| match item.pricing {
+                config::SpeechPricing::PerCharacter { price_usd_nanos_per_character } => json!({
                     "model": item.model,
-                    "price_usd_nanos_per_character": item.price_usd_nanos_per_character,
-                })
+                    "price_usd_nanos_per_character": price_usd_nanos_per_character,
+                }),
+                config::SpeechPricing::PerToken {
+                    price_usd_nanos_per_million_input_tokens,
+                    price_usd_nanos_per_million_output_tokens,
+                } => json!({
+                    "model": item.model,
+                    "price_usd_nanos_per_million_input_tokens": price_usd_nanos_per_million_input_tokens,
+                    "price_usd_nanos_per_million_output_tokens": price_usd_nanos_per_million_output_tokens,
+                }),
             })
             .collect::<Vec<_>>(),
     )?;
@@ -2022,6 +2081,91 @@ mod tests {
             "0.000030556"
         );
         assert_eq!(value["speech"][0]["price_usd_per_character"], "0.000011111");
+    }
+
+    #[tokio::test]
+    async fn audio_prices_render_token_rates() {
+        let state = crate::test_state("http://upstream.invalid").await;
+        let mut config = (**state.config.load()).clone();
+        config.speech_models.push(config::SpeechModel {
+            model: "qwen-audio-3.1-tts-flash".to_owned(),
+            pricing: config::SpeechPricing::PerToken {
+                price_usd_nanos_per_million_input_tokens: 208_333_333,
+                price_usd_nanos_per_million_output_tokens: 1_666_666_667,
+            },
+        });
+        state.config.store(std::sync::Arc::new(config));
+        let Json(value) = audio_prices(State(state)).await;
+        assert_eq!(
+            value["speech"][1]["price_usd_per_million_input_tokens"],
+            "0.208333333"
+        );
+        assert_eq!(
+            value["speech"][1]["price_usd_per_million_output_tokens"],
+            "1.666666667"
+        );
+    }
+
+    #[tokio::test]
+    async fn speech_models_update_accepts_token_rates() {
+        let state = crate::test_state("http://upstream.invalid").await;
+        seed_users(&state).await;
+        let Json(value) = update_speech_models(
+            State(state.clone()),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+            Extension(identity("admin", "admin")),
+            Json(UpdateSpeechModels {
+                models: vec![
+                    SpeechModelInput {
+                        model: "qwen3-tts-flash".to_owned(),
+                        price_usd_per_character: Some("0.000011111".to_owned()),
+                        price_usd_per_million_input_tokens: None,
+                        price_usd_per_million_output_tokens: None,
+                    },
+                    SpeechModelInput {
+                        model: "qwen-audio-3.1-tts-flash".to_owned(),
+                        price_usd_per_character: None,
+                        price_usd_per_million_input_tokens: Some("0.208333333".to_owned()),
+                        price_usd_per_million_output_tokens: Some("1.666666667".to_owned()),
+                    },
+                ],
+                default_model: "qwen3-tts-flash".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["ok"], true);
+        let loaded = state.config.load_full();
+        assert_eq!(
+            loaded.speech_pricing("qwen-audio-3.1-tts-flash"),
+            Some(config::SpeechPricing::PerToken {
+                price_usd_nanos_per_million_input_tokens: 208_333_333,
+                price_usd_nanos_per_million_output_tokens: 1_666_666_667,
+            })
+        );
+        let stored: String =
+            sqlx::query_scalar("SELECT value FROM app_meta WHERE key='speech_models'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert!(stored.contains("price_usd_nanos_per_million_input_tokens"));
+
+        let rejected = update_speech_models(
+            State(state.clone()),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+            Extension(identity("admin", "admin")),
+            Json(UpdateSpeechModels {
+                models: vec![SpeechModelInput {
+                    model: "x".to_owned(),
+                    price_usd_per_character: None,
+                    price_usd_per_million_input_tokens: Some("0.1".to_owned()),
+                    price_usd_per_million_output_tokens: None,
+                }],
+                default_model: "x".to_owned(),
+            }),
+        )
+        .await;
+        assert!(rejected.is_err());
     }
 
     #[tokio::test]
