@@ -19,7 +19,7 @@ Qwen 的 OpenAI 兼容层并不提供 `/audio/transcriptions`；官方文档明�
 - 逐调用审计：模型、Provider、音频秒数或合成字符数、费用、首字节与总延迟、错误码，以及可选的请求/响应诊断正文。
 - 语音计价：转写按音频秒数计费；合成按输出字符数或输入/输出 Token 数计费（随模型的计价方式，与调用方式相互独立）；价格表由管理员在「设置」中维护（价格从 Qwen 官方人民币价目按 7.2 汇率折算为美元纳元）。
 - 请求费用查询：下游记录响应头 `x-qwen-lb-request-id` 后，可按单条或批量查询每次调用的实收金额与用量；支持上游网关（NormAI）通过 `x-normai-request-id` 传入统一请求 ID，跨上游的定价差异由各负载均衡器内部处理。
-- 控制台「语音工坊」：直接用登录身份试用一次转写或语音合成（`POST /api/transcriptions`、`POST /api/speech`），无需准备 Consumer 凭据。
+- 控制台「语音工坊」：直接用登录身份试用一次转写或语音合成（`POST /api/transcriptions`、`POST /api/speech`），无需准备 Consumer 凭据；合成音色会随所选模型给出系统音色候选（CosyVoice v3.5 无系统音色，需填写自定义音色 ID）。
 - Midas 预付费：用户向 fund 账户充值后即可调用；未充值且未开启欠费的请求返回 HTTP 402。
 - Auth Mini 统一登录（Ed25519 JWT / JWKS），首个登录用户绑定为 root。
 - root/admin 视图包含仪表盘、上游、消费者、用量、审计、提供商审计、语音计价、系统资源、用户与设置；普通用户只看到自己的工作区。

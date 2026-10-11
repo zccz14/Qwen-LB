@@ -105,3 +105,16 @@ test("lets speech models choose their upstream surface", () => {
   assert.match(settings, /value === "speech_synthesizer"/)
   assert.match(settings, /surface: row\.surface \?\? "multimodal"/)
 })
+
+test("lets the speech tool pick model-aware voices", () => {
+  const speech = app.slice(
+    app.indexOf("function SpeechTool"),
+    app.indexOf("function Dashboard")
+  )
+
+  assert.match(speech, /speechVoiceSuggestions/)
+  assert.match(speech, /speechVoiceRequiresCustom/)
+  assert.match(speech, /speechVoiceSurvivesModelChange/)
+  assert.match(speech, /<Autocomplete/)
+  assert.match(speech, /voiceVoiceCustomHelp/)
+})
