@@ -537,6 +537,7 @@ pub(crate) async fn test_state(upstream_base: &str) -> AppState {
             pricing: config::SpeechPricing::PerCharacter {
                 price_usd_nanos_per_character: 11111,
             },
+            surface: config::SpeechSurface::Multimodal,
         }],
         default_speech_model: config::DEFAULT_SPEECH_MODEL.to_owned(),
         allow_all_users_debt: false,

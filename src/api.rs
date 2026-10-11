@@ -82,6 +82,7 @@ pub async fn audio_prices(State(state): State<AppState>) -> Json<Value> {
         "speech": config.speech_models.iter().map(|item| match item.pricing {
             config::SpeechPricing::PerCharacter { price_usd_nanos_per_character } => json!({
                 "model": item.model,
+                "surface": item.surface.as_str(),
                 "price_usd_per_character": payments::format_usd_nanos(price_usd_nanos_per_character),
             }),
             config::SpeechPricing::PerToken {
@@ -89,6 +90,7 @@ pub async fn audio_prices(State(state): State<AppState>) -> Json<Value> {
                 price_usd_nanos_per_million_output_tokens,
             } => json!({
                 "model": item.model,
+                "surface": item.surface.as_str(),
                 "price_usd_per_million_input_tokens": payments::format_usd_nanos(price_usd_nanos_per_million_input_tokens),
                 "price_usd_per_million_output_tokens": payments::format_usd_nanos(price_usd_nanos_per_million_output_tokens),
             }),
@@ -1465,6 +1467,7 @@ pub async fn settings(
         "speech_models":config.speech_models.iter().map(|item| match item.pricing {
             config::SpeechPricing::PerCharacter { price_usd_nanos_per_character } => json!({
                 "model": item.model,
+                "surface": item.surface.as_str(),
                 "price_usd_per_character": payments::format_usd_nanos(price_usd_nanos_per_character),
             }),
             config::SpeechPricing::PerToken {
@@ -1472,6 +1475,7 @@ pub async fn settings(
                 price_usd_nanos_per_million_output_tokens,
             } => json!({
                 "model": item.model,
+                "surface": item.surface.as_str(),
                 "price_usd_per_million_input_tokens": payments::format_usd_nanos(price_usd_nanos_per_million_input_tokens),
                 "price_usd_per_million_output_tokens": payments::format_usd_nanos(price_usd_nanos_per_million_output_tokens),
             }),
@@ -1619,6 +1623,9 @@ pub struct SpeechModelInput {
     price_usd_per_character: Option<String>,
     price_usd_per_million_input_tokens: Option<String>,
     price_usd_per_million_output_tokens: Option<String>,
+    /// Upstream surface (`multimodal` / `speech_synthesizer`); absent derives
+    /// it from the pricing unit.
+    surface: Option<String>,
 }
 
 pub async fn update_speech_models(
@@ -1629,40 +1636,47 @@ pub async fn update_speech_models(
 ) -> Result<Json<Value>, AppError> {
     require_admin(&user)?;
     let models_json = voice_models_json(&input.models, |input| {
-        Ok(
-            match (
-                &input.price_usd_per_character,
-                &input.price_usd_per_million_input_tokens,
-                &input.price_usd_per_million_output_tokens,
-            ) {
-                (Some(rate), None, None) => json!({
-                    "model": input.model,
-                    "price_usd_nanos_per_character": payments::parse_rate_usd_nanos(
-                        rate,
-                        "price_usd_per_character",
-                        1_000_000,
-                    )?,
-                }),
-                (None, Some(input_rate), Some(output_rate)) => json!({
-                    "model": input.model,
-                    "price_usd_nanos_per_million_input_tokens": payments::parse_rate_usd_nanos(
-                        input_rate,
-                        "price_usd_per_million_input_tokens",
-                        100_000_000_000,
-                    )?,
-                    "price_usd_nanos_per_million_output_tokens": payments::parse_rate_usd_nanos(
-                        output_rate,
-                        "price_usd_per_million_output_tokens",
-                        100_000_000_000,
-                    )?,
-                }),
-                _ => {
-                    return Err(AppError::bad_request(
-                        "each speech model needs either a per-character rate or per-million-token input and output rates",
-                    ));
-                }
-            },
-        )
+        let mut value = match (
+            &input.price_usd_per_character,
+            &input.price_usd_per_million_input_tokens,
+            &input.price_usd_per_million_output_tokens,
+        ) {
+            (Some(rate), None, None) => json!({
+                "model": input.model,
+                "price_usd_nanos_per_character": payments::parse_rate_usd_nanos(
+                    rate,
+                    "price_usd_per_character",
+                    1_000_000,
+                )?,
+            }),
+            (None, Some(input_rate), Some(output_rate)) => json!({
+                "model": input.model,
+                "price_usd_nanos_per_million_input_tokens": payments::parse_rate_usd_nanos(
+                    input_rate,
+                    "price_usd_per_million_input_tokens",
+                    100_000_000_000,
+                )?,
+                "price_usd_nanos_per_million_output_tokens": payments::parse_rate_usd_nanos(
+                    output_rate,
+                    "price_usd_per_million_output_tokens",
+                    100_000_000_000,
+                )?,
+            }),
+            _ => {
+                return Err(AppError::bad_request(
+                    "each speech model needs either a per-character rate or per-million-token input and output rates",
+                ));
+            }
+        };
+        if let Some(surface) = input
+            .surface
+            .as_deref()
+            .map(str::trim)
+            .filter(|surface| !surface.is_empty())
+        {
+            value["surface"] = json!(surface);
+        }
+        Ok(value)
     })?;
     let models = config::normalize_speech_models(models_json).map_err(AppError::bad_request)?;
     let default_model =
@@ -1673,6 +1687,7 @@ pub async fn update_speech_models(
             .map(|item| match item.pricing {
                 config::SpeechPricing::PerCharacter { price_usd_nanos_per_character } => json!({
                     "model": item.model,
+                    "surface": item.surface.as_str(),
                     "price_usd_nanos_per_character": price_usd_nanos_per_character,
                 }),
                 config::SpeechPricing::PerToken {
@@ -1680,6 +1695,7 @@ pub async fn update_speech_models(
                     price_usd_nanos_per_million_output_tokens,
                 } => json!({
                     "model": item.model,
+                    "surface": item.surface.as_str(),
                     "price_usd_nanos_per_million_input_tokens": price_usd_nanos_per_million_input_tokens,
                     "price_usd_nanos_per_million_output_tokens": price_usd_nanos_per_million_output_tokens,
                 }),
@@ -2081,6 +2097,7 @@ mod tests {
             "0.000030556"
         );
         assert_eq!(value["speech"][0]["price_usd_per_character"], "0.000011111");
+        assert_eq!(value["speech"][0]["surface"], "multimodal");
     }
 
     #[tokio::test]
@@ -2093,6 +2110,7 @@ mod tests {
                 price_usd_nanos_per_million_input_tokens: 208_333_333,
                 price_usd_nanos_per_million_output_tokens: 1_666_666_667,
             },
+            surface: config::SpeechSurface::SpeechSynthesizer,
         });
         state.config.store(std::sync::Arc::new(config));
         let Json(value) = audio_prices(State(state)).await;
@@ -2104,6 +2122,7 @@ mod tests {
             value["speech"][1]["price_usd_per_million_output_tokens"],
             "1.666666667"
         );
+        assert_eq!(value["speech"][1]["surface"], "speech_synthesizer");
     }
 
     #[tokio::test]
@@ -2121,12 +2140,21 @@ mod tests {
                         price_usd_per_character: Some("0.000011111".to_owned()),
                         price_usd_per_million_input_tokens: None,
                         price_usd_per_million_output_tokens: None,
+                        surface: None,
                     },
                     SpeechModelInput {
                         model: "qwen-audio-3.1-tts-flash".to_owned(),
                         price_usd_per_character: None,
                         price_usd_per_million_input_tokens: Some("0.208333333".to_owned()),
                         price_usd_per_million_output_tokens: Some("1.666666667".to_owned()),
+                        surface: None,
+                    },
+                    SpeechModelInput {
+                        model: "cosyvoice-v3.5-flash".to_owned(),
+                        price_usd_per_character: Some("0.000011111".to_owned()),
+                        price_usd_per_million_input_tokens: None,
+                        price_usd_per_million_output_tokens: None,
+                        surface: Some("speech_synthesizer".to_owned()),
                     },
                 ],
                 default_model: "qwen3-tts-flash".to_owned(),
@@ -2143,12 +2171,32 @@ mod tests {
                 price_usd_nanos_per_million_output_tokens: 1_666_666_667,
             })
         );
+        // Absent surfaces derive from the pricing unit; explicit ones stick.
+        assert_eq!(
+            loaded.speech_surface("qwen3-tts-flash"),
+            Some(config::SpeechSurface::Multimodal)
+        );
+        assert_eq!(
+            loaded.speech_surface("qwen-audio-3.1-tts-flash"),
+            Some(config::SpeechSurface::SpeechSynthesizer)
+        );
+        assert_eq!(
+            loaded.speech_surface("cosyvoice-v3.5-flash"),
+            Some(config::SpeechSurface::SpeechSynthesizer)
+        );
+        assert_eq!(
+            loaded.speech_pricing("cosyvoice-v3.5-flash"),
+            Some(config::SpeechPricing::PerCharacter {
+                price_usd_nanos_per_character: 11_111
+            })
+        );
         let stored: String =
             sqlx::query_scalar("SELECT value FROM app_meta WHERE key='speech_models'")
                 .fetch_one(&state.db)
                 .await
                 .unwrap();
         assert!(stored.contains("price_usd_nanos_per_million_input_tokens"));
+        assert!(stored.contains("\"surface\":\"speech_synthesizer\""));
 
         let rejected = update_speech_models(
             State(state.clone()),
@@ -2160,12 +2208,31 @@ mod tests {
                     price_usd_per_character: None,
                     price_usd_per_million_input_tokens: Some("0.1".to_owned()),
                     price_usd_per_million_output_tokens: None,
+                    surface: None,
                 }],
                 default_model: "x".to_owned(),
             }),
         )
         .await;
         assert!(rejected.is_err());
+
+        let rejected_surface = update_speech_models(
+            State(state.clone()),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+            Extension(identity("admin", "admin")),
+            Json(UpdateSpeechModels {
+                models: vec![SpeechModelInput {
+                    model: "x".to_owned(),
+                    price_usd_per_character: Some("0.1".to_owned()),
+                    price_usd_per_million_input_tokens: None,
+                    price_usd_per_million_output_tokens: None,
+                    surface: Some("banana".to_owned()),
+                }],
+                default_model: "x".to_owned(),
+            }),
+        )
+        .await;
+        assert!(rejected_surface.is_err());
     }
 
     #[tokio::test]

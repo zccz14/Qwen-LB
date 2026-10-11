@@ -22,20 +22,21 @@ use crate::{
     audit::{ARCHIVE_BODY_LIMIT, AuditEvent, AuditReservation},
     auth::{ApiIdentity, UserIdentity, api_identity},
     balancer::{Downstream, Lease, affinity_hash, track_response},
-    config::SpeechPricing,
+    config::{SpeechPricing, SpeechSurface},
     crypto::consumer_secret_hash,
     midas,
 };
 
 /// The multimodal-generation surface: one JSON POST that transcribes an
-/// audio to text, and synthesizes the character-priced speech models, exactly
-/// as the Qwen platform documents it.
+/// audio to text, and synthesizes the speech models assigned to it (Qwen3-TTS
+/// and other character-priced models), exactly as the Qwen platform
+/// documents it.
 const GENERATION_PATH: &str = "/api/v1/services/aigc/multimodal-generation/generation";
 
-/// The non-real-time speech-synthesis surface (Qwen-Audio-TTS) that the
-/// token-priced speech models such as `qwen-audio-3.1-tts-flash` are billed
-/// through; `usage.input_tokens` / `usage.output_tokens` from this response
-/// are the billing basis.
+/// The non-real-time speech-synthesis surface (SpeechSynthesizer) that the
+/// CosyVoice and Qwen-Audio-TTS families are called on: CosyVoice models bill
+/// from `usage.characters`, `qwen-audio-3.1-tts-flash` from
+/// `usage.input_tokens` / `usage.output_tokens`.
 const SPEECH_SYNTHESIZER_PATH: &str = "/api/v1/services/audio/tts/SpeechSynthesizer";
 
 pub(crate) const TRANSCRIPTION_PATH: &str = "/v1/audio/transcriptions";
@@ -579,18 +580,21 @@ fn build_transcription_body(
 /// Builds the upstream speech request: the multimodal-generation surface for
 /// per-character pricing, or the non-real-time speech-synthesis surface (WAV
 /// at 24 kHz) for per-token pricing.
+/// Builds the upstream call for one speech request. The row's surface picks
+/// the endpoint and the body shape; its pricing unit only affects how the
+/// reply is billed.
 fn speech_upstream_request(
+    surface: SpeechSurface,
     model: &str,
     input: &str,
     voice: &str,
-    pricing: SpeechPricing,
 ) -> (&'static str, Value) {
-    match pricing {
-        SpeechPricing::PerCharacter { .. } => (
+    match surface {
+        SpeechSurface::Multimodal => (
             GENERATION_PATH,
             json!({"model": model, "input": {"text": input, "voice": voice}}),
         ),
-        SpeechPricing::PerToken { .. } => (
+        SpeechSurface::SpeechSynthesizer => (
             SPEECH_SYNTHESIZER_PATH,
             json!({
                 "model": model,
@@ -828,9 +832,11 @@ async fn dispatch_speech(
             .filter(|model| !model.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| config.default_speech_model.clone());
-        let pricing = config
-            .speech_pricing(&model)
+        let speech_model = config
+            .speech_model(&model)
             .ok_or_else(|| AppError::bad_request(format!("model is not available: {model}")))?;
+        let pricing = speech_model.pricing;
+        let surface = speech_model.surface;
         let voice = value
             .get("voice")
             .and_then(Value::as_str)
@@ -841,7 +847,7 @@ async fn dispatch_speech(
         audit.set_requested_model(Some(&model));
         ensure_request_quota(&state, &identity.user_id, identity.allow_debt).await?;
         let (upstream_path, upstream_body) =
-            speech_upstream_request(&model, &input, &voice, pricing);
+            speech_upstream_request(surface, &model, &input, &voice);
         let upstream_body = serde_json::to_vec(&upstream_body)?;
         let downstream = Downstream::new(&identity.user_id);
         let routed = route_upstream(
@@ -1899,6 +1905,7 @@ mod tests {
                 price_usd_nanos_per_million_input_tokens: 208_333_333,
                 price_usd_nanos_per_million_output_tokens: 1_666_666_667,
             },
+            surface: SpeechSurface::SpeechSynthesizer,
         });
         state.config.store(std::sync::Arc::new(config));
 
@@ -1941,6 +1948,111 @@ mod tests {
         assert_eq!(call.output_tokens, 62);
         // 28 * 208333333 + 62 * 1666666667 = 109166666678 nanodollars per million tokens.
         assert_eq!(call.cost_usd_nanos, 109_167);
+    }
+
+    #[tokio::test]
+    async fn character_priced_speech_bills_from_the_synthesizer_surface() {
+        let audio: Vec<u8> = vec![0x52, 0x49, 0x46, 0x46, 0x11, 0x22, 0x33, 0x44];
+        let seen: Arc<Mutex<Option<UpstreamRequest>>> = Arc::default();
+        let seen_upstream = seen.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let base = format!("http://{addr}");
+        let audio_base = base.clone();
+        let audio_route = audio.clone();
+        // Only the speech-synthesizer path exists: a request routed to the
+        // multimodal surface instead would get a 404 and fail the response.
+        let upstream = Router::new()
+            .route(
+                SPEECH_SYNTHESIZER_PATH,
+                post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                    let seen = seen_upstream.clone();
+                    let base = audio_base.clone();
+                    async move {
+                        let authorization = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        let value = serde_json::from_slice(&body).unwrap();
+                        *seen.lock().await = Some(UpstreamRequest {
+                            authorization,
+                            body: value,
+                        });
+                        Json(json!({
+                            "output": {"audio": {"url": format!("{base}/audio.wav")}},
+                            "usage": {"characters": 13},
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/audio.wav",
+                get(move || {
+                    let audio = audio_route.clone();
+                    async move { ([(header::CONTENT_TYPE, "audio/wav")], audio) }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state = crate::test_state(&base).await;
+        seed_consumer_and_owner(&state, "user").await;
+        seed_provider(&state, "provider", "sk-provider", "user").await;
+        let mut config = (**state.config.load()).clone();
+        // A CosyVoice-style row: per-character pricing, explicitly on the
+        // speech-synthesizer surface instead of the pricing unit's default.
+        config.speech_models.push(crate::config::SpeechModel {
+            model: "cosyvoice-v3.5-flash".to_owned(),
+            pricing: SpeechPricing::PerCharacter {
+                price_usd_nanos_per_character: 11_111,
+            },
+            surface: SpeechSurface::SpeechSynthesizer,
+        });
+        state.config.store(std::sync::Arc::new(config));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header(header::AUTHORIZATION, format!("Bearer {CONSUMER_SECRET}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-normai-request-id", "req-integration-4")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "input": "你好，世界。",
+                    "model": "cosyvoice-v3.5-flash",
+                    "voice": "cosyvoice-v3.5-flash-vd-demo-abc123",
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = send(state.clone(), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), audio.as_slice());
+
+        let upstream_request = seen.lock().await.clone().unwrap();
+        assert_eq!(
+            upstream_request.authorization.as_deref(),
+            Some("Bearer sk-provider")
+        );
+        assert_eq!(upstream_request.body["model"], "cosyvoice-v3.5-flash");
+        assert_eq!(upstream_request.body["input"]["text"], "你好，世界。");
+        assert_eq!(
+            upstream_request.body["input"]["voice"],
+            "cosyvoice-v3.5-flash-vd-demo-abc123"
+        );
+        assert_eq!(upstream_request.body["input"]["format"], "wav");
+        assert_eq!(upstream_request.body["input"]["sample_rate"], 24000);
+
+        let call = wait_for_call(&state, "req-integration-4").await;
+        assert_eq!(call.status, 200);
+        assert_eq!(call.model.as_deref(), Some("cosyvoice-v3.5-flash"));
+        assert_eq!(call.characters, 13);
+        assert_eq!(call.input_tokens, 0);
+        assert_eq!(call.output_tokens, 0);
+        // 13 characters on the per-character rate: 13 * 11111 nanodollars.
+        assert_eq!(call.cost_usd_nanos, 144_443);
     }
 
     #[tokio::test]
