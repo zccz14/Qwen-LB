@@ -1825,24 +1825,14 @@ function Console({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
 
   return (
     <AppLayout
-      logo={{
-        light: (
-          <img
-            alt=""
-            aria-hidden="true"
-            className="size-7 shrink-0"
-            src="/qwen.svg"
-          />
-        ),
-        dark: (
-          <img
-            alt=""
-            aria-hidden="true"
-            className="size-7 shrink-0"
-            src="/qwen.svg"
-          />
-        ),
-      }}
+      logo={
+        <img
+          alt=""
+          aria-hidden="true"
+          className="size-7 shrink-0"
+          src="/qwen.svg"
+        />
+      }
       title={t.title}
       nav={nav}
       pageTitle={pageTitle(page, locale)}
