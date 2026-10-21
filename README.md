@@ -30,20 +30,20 @@ Qwen 的 OpenAI 兼容层并不提供 `/audio/transcriptions`；官方文档明�
 
 ```bash
 cd web
-npm ci
-npm run build
+pnpm install --frozen-lockfile
+pnpm run build
 cd ..
 cargo run
 ```
 
-开发前端时运行 `npm run dev`；Vite 会把 `/api` 与 `/v1` 请求代理到 `http://localhost:8080`。
+开发前端时运行 `pnpm run dev`；Vite 会把 `/api` 与 `/v1` 请求代理到 `http://localhost:8080`。
 
 首次启动后打开 `http://localhost:8080`，用 Auth Mini 登录完成 root 绑定；随后在「上游提供商」里添加 Qwen API Key，在「下游消费者」里创建 Consumer，即可把 AI App 指向本服务。
 
 生产构建先生成一次 `web/dist`，Rust 只负责嵌入已有静态资源：
 
 ```bash
-cd web && npm ci && npm run check && cd ..
+cd web && pnpm install --frozen-lockfile && pnpm run check && cd ..
 cargo build --release --locked
 ```
 
@@ -144,7 +144,7 @@ curl https://qwen.ntnl.io/v1/requests/query \
 ## 开发与校验
 
 ```bash
-cd web && npm ci && npm run check && cd ..            # 前端测试、类型检查、Lint、构建与样式检查
+cd web && pnpm install --frozen-lockfile && pnpm run check && cd ..            # 前端测试、类型检查、Lint、构建与样式检查
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features --locked
