@@ -222,6 +222,10 @@ impl AuditTracker {
         }
     }
 
+    fn request_id(&self) -> Option<&str> {
+        self.event.as_ref().map(|event| event.request_id.as_str())
+    }
+
     fn set_affinity(&mut self, key: Option<&str>, source: Option<&str>) {
         if let Some(event) = &mut self.event {
             event.affinity_hash = key.map(affinity_hash);
@@ -609,6 +613,17 @@ fn speech_upstream_request(
     }
 }
 
+/// Whether one transcription reply states the amount it was billed.
+///
+/// The public `/v1/audio/transcriptions` endpoint answers with `cost_usd_nanos`:
+/// the amount the audit row books, and the same one `GET /v1/requests/{id}`
+/// reports. The signed-in console tool keeps the reply shape it has always had.
+#[derive(Clone, Copy)]
+enum TranscriptionReceipt {
+    Include,
+    Exclude,
+}
+
 pub async fn handle_transcription(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -623,7 +638,15 @@ pub async fn handle_transcription(
         method,
         client_ip: peer.ip().to_string(),
     };
-    dispatch_transcription(state, identity, audit_context, headers, multipart).await
+    dispatch_transcription(
+        state,
+        identity,
+        audit_context,
+        headers,
+        multipart,
+        TranscriptionReceipt::Include,
+    )
+    .await
 }
 
 /// The console speech-to-text tool: a signed-in browser transcribes audio on
@@ -642,7 +665,15 @@ pub async fn handle_console_transcription(
         method: Method::POST,
         client_ip: peer.ip().to_string(),
     };
-    dispatch_transcription(state, identity, audit_context, headers, multipart).await
+    dispatch_transcription(
+        state,
+        identity,
+        audit_context,
+        headers,
+        multipart,
+        TranscriptionReceipt::Exclude,
+    )
+    .await
 }
 
 async fn dispatch_transcription(
@@ -651,6 +682,7 @@ async fn dispatch_transcription(
     audit_context: RequestAuditContext,
     headers: HeaderMap,
     multipart: Multipart,
+    receipt: TranscriptionReceipt,
 ) -> Result<Response, AppError> {
     let affinity_key = affinity_key(&headers);
     let affinity = affinity_key
@@ -729,6 +761,7 @@ async fn dispatch_transcription(
             routed.upstream,
             &model,
             price_usd_nanos_per_second,
+            receipt,
             &mut audit,
         )
         .await
@@ -1245,6 +1278,7 @@ async fn relay_transcription(
     upstream: UpstreamResponse,
     model: &str,
     price_usd_nanos_per_second: i64,
+    receipt: TranscriptionReceipt,
     audit: &mut AuditTracker,
 ) -> Result<Response, AppError> {
     audit.mark_first_byte();
@@ -1276,12 +1310,31 @@ async fn relay_transcription(
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
         .ok_or_else(|| AppError::upstream(502, "transcription response is missing text"))?;
-    let audio_seconds = value
+    // What this call is billed on is the upstream's own duration report, and
+    // the settlement below keeps pricing it exactly as it always has. A reply
+    // that reports no usable duration is still settled as 0 — but it cannot
+    // state what it cost, so the receipt is left out instead of claiming 0.
+    let reported_audio_seconds = value
         .pointer("/usage/duration")
         .and_then(Value::as_f64)
-        .unwrap_or_default();
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0);
+    let audio_seconds = reported_audio_seconds.unwrap_or_default();
     let cost_usd_nanos = (price_usd_nanos_per_second as f64 * audio_seconds).round() as i64;
-    let envelope = serde_json::to_vec(&json!({"text": text}))?;
+    let amount = match (receipt, reported_audio_seconds) {
+        // `.max(0)` is the clamp `settle` books, so the receipt, the audit row
+        // and `GET /v1/requests/{id}` are always the same number.
+        (TranscriptionReceipt::Include, Some(_)) => Some(cost_usd_nanos.max(0)),
+        (TranscriptionReceipt::Include, None) => {
+            tracing::warn!(
+                request_id = audit.request_id().unwrap_or_default(),
+                model,
+                "transcription response reported no usage duration; omitting cost_usd_nanos"
+            );
+            None
+        }
+        (TranscriptionReceipt::Exclude, _) => None,
+    };
+    let envelope = transcription_envelope(text, amount)?;
     audit.set_response_size(envelope.len() as i64);
     audit.set_response_body(&envelope, false);
     let audit_id = audit.finish(
@@ -1301,6 +1354,17 @@ async fn relay_transcription(
         response.extensions_mut().insert(id);
     }
     Ok(response)
+}
+
+/// The reply a transcription returns: the text, plus — for the public
+/// endpoint — the amount this call was billed. Without an amount the reply is
+/// the bare `{"text": …}` object it has always been, byte for byte.
+fn transcription_envelope(text: &str, cost_usd_nanos: Option<i64>) -> Result<Vec<u8>, AppError> {
+    let mut envelope = json!({"text": text});
+    if let Some(cost_usd_nanos) = cost_usd_nanos {
+        envelope["cost_usd_nanos"] = cost_usd_nanos.into();
+    }
+    Ok(serde_json::to_vec(&envelope)?)
 }
 
 /// Reads one speech response's billable usage. A per-character model bills
@@ -1671,6 +1735,10 @@ mod tests {
     }
 
     fn transcription_multipart(boundary: &str) -> Vec<u8> {
+        transcription_multipart_for(boundary, "qwen-audio-3.0-asr-flash")
+    }
+
+    fn transcription_multipart_for(boundary: &str, model: &str) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(
             format!(
@@ -1681,7 +1749,7 @@ mod tests {
         body.extend_from_slice(b"RIFFdata");
         body.extend_from_slice(
             format!(
-                "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nqwen-audio-3.0-asr-flash\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nzh\r\n--{boundary}--\r\n"
+                "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nzh\r\n--{boundary}--\r\n"
             )
             .as_bytes(),
         );
@@ -1744,7 +1812,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(
             serde_json::from_slice::<Value>(&body).unwrap(),
-            json!({"text": "欢迎使用阿里云。"})
+            json!({"text": "欢迎使用阿里云。", "cost_usd_nanos": 76_390})
         );
 
         let upstream_request = seen.lock().await.clone().unwrap();
@@ -2105,9 +2173,11 @@ mod tests {
         let response = send(state.clone(), request).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
+        // The retried call is billed the same way any other call is, so its
+        // reply states the amount: 1.0 s at the seeded 30_556 nanos/s.
         assert_eq!(
             serde_json::from_slice::<Value>(&body).unwrap(),
-            json!({"text": "ok"})
+            json!({"text": "ok", "cost_usd_nanos": 30_556})
         );
 
         let call = wait_for_call(&state, "req-integration-3").await;
@@ -2171,5 +2241,202 @@ mod tests {
         assert_eq!(value["requests"][0]["cost_usd_nanos"], 76_390);
         assert_eq!(value["requests"][0]["audio_seconds"], 2.5);
         assert_eq!(value["missing"], json!(["req-missing"]));
+    }
+
+    /// Spawns the native transcription surface answering with `reply`, then
+    /// transcribes one sample under `request_id` and returns the response.
+    async fn transcribe(
+        reply: Value,
+        request_id: &str,
+    ) -> (AppState, StatusCode, Bytes, SettledCall) {
+        let upstream = Router::new().route(
+            GENERATION_PATH,
+            post(move || {
+                let reply = reply.clone();
+                async move { Json(reply) }
+            }),
+        );
+        let base = spawn_server(upstream);
+        let state = crate::test_state(&base).await;
+        seed_consumer_and_owner(&state, "user").await;
+        seed_provider(&state, "provider", "sk-provider", "user").await;
+        let boundary = "qwen-boundary";
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header(header::AUTHORIZATION, format!("Bearer {CONSUMER_SECRET}"))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .header("x-normai-request-id", request_id)
+            .body(Body::from(transcription_multipart(boundary)))
+            .unwrap();
+        let response = send(state.clone(), request).await;
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let call = wait_for_call(&state, request_id).await;
+        (state, status, body, call)
+    }
+
+    /// INVARIANT: the amount a transcription replies with is the amount the
+    /// audit row books, which is the amount `GET /v1/requests/{id}` answers.
+    #[tokio::test]
+    async fn transcription_receipt_equals_the_audit_row_and_the_request_record() {
+        let (state, status, body, call) = transcribe(
+            json!({
+                "output": {"text": "你好。"},
+                "usage": {"duration": 2.5},
+            }),
+            "req-receipt-1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let reply: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["text"], "你好。");
+        let receipt = reply["cost_usd_nanos"]
+            .as_i64()
+            .expect("a successful transcription states the amount it was billed");
+        // 2.5 s at the seeded 30_556 nanos/s.
+        assert_eq!(receipt, 76_390);
+        assert_eq!(call.cost_usd_nanos, receipt);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/requests/req-receipt-1")
+            .header(header::AUTHORIZATION, format!("Bearer {CONSUMER_SECRET}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = send(state, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let record: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(record["request_id"], "req-receipt-1");
+        assert_eq!(record["cost_usd_nanos"].as_i64(), Some(receipt));
+    }
+
+    /// A reply whose upstream reported no usable duration states no amount:
+    /// the settlement stays as it was (0), and nothing claims the call was free.
+    #[tokio::test]
+    async fn transcription_without_a_usage_report_replies_with_the_bare_text() {
+        let (_state, status, body, call) =
+            transcribe(json!({"output": {"text": "你好。"}}), "req-no-usage").await;
+        assert_eq!(status, StatusCode::OK);
+        // Byte for byte: only the public endpoint adds an amount, and this
+        // reply reported none.
+        assert_eq!(body, "{\"text\":\"你好。\"}".as_bytes());
+        assert_eq!(call.audio_seconds, 0.0);
+        assert_eq!(call.cost_usd_nanos, 0);
+    }
+
+    /// A duration the upstream did report is billed — and stated — even when it
+    /// rounds to nothing.
+    #[tokio::test]
+    async fn transcription_receipt_states_a_reported_zero_duration() {
+        let (_state, status, body, call) = transcribe(
+            json!({
+                "output": {"text": "你好。"},
+                "usage": {"duration": 0.0},
+            }),
+            "req-zero-usage",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let reply: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["cost_usd_nanos"], 0);
+        assert_eq!(call.cost_usd_nanos, 0);
+    }
+
+    /// Failures keep the upstream answer exactly as it arrives.
+    #[tokio::test]
+    async fn transcription_failures_relay_the_upstream_body_unchanged() {
+        let upstream = Router::new().route(
+            GENERATION_PATH,
+            post(|| async {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": {"message": "upstream unavailable"}})),
+                )
+            }),
+        );
+        let base = spawn_server(upstream);
+        let state = crate::test_state(&base).await;
+        seed_consumer_and_owner(&state, "user").await;
+        seed_provider(&state, "provider", "sk-provider", "user").await;
+        let boundary = "qwen-boundary";
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header(header::AUTHORIZATION, format!("Bearer {CONSUMER_SECRET}"))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .header("x-normai-request-id", "req-upstream-failed")
+            .body(Body::from(transcription_multipart(boundary)))
+            .unwrap();
+        let response = send(state.clone(), request).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            body.as_ref(),
+            br#"{"error":{"message":"upstream unavailable"}}"#
+        );
+        let call = wait_for_call(&state, "req-upstream-failed").await;
+        assert_eq!(call.status, 500);
+        assert_eq!(call.cost_usd_nanos, 0);
+    }
+
+    /// An unpriced model never reaches the upstream, so no amount is stated.
+    #[tokio::test]
+    async fn an_unpriced_transcription_model_is_rejected_without_a_receipt() {
+        let upstream = Router::new().route(
+            GENERATION_PATH,
+            post(|| async { Json(json!({"output": {"text": "不可能到达"}})) }),
+        );
+        let base = spawn_server(upstream);
+        let state = crate::test_state(&base).await;
+        seed_consumer_and_owner(&state, "user").await;
+        seed_provider(&state, "provider", "sk-provider", "user").await;
+        let boundary = "qwen-boundary";
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header(header::AUTHORIZATION, format!("Bearer {CONSUMER_SECRET}"))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .header("x-normai-request-id", "req-unpriced")
+            .body(Body::from(transcription_multipart_for(
+                boundary,
+                "qwen-audio-not-configured",
+            )))
+            .unwrap();
+        let response = send(state.clone(), request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], 400);
+        assert!(value.get("cost_usd_nanos").is_none());
+        let call = wait_for_call(&state, "req-unpriced").await;
+        assert_eq!(call.status, 400);
+        assert_eq!(call.cost_usd_nanos, 0);
+    }
+
+    #[test]
+    fn a_transcription_envelope_without_an_amount_is_the_bare_text_reply() {
+        assert_eq!(
+            transcription_envelope("你好。", None).unwrap(),
+            "{\"text\":\"你好。\"}".as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_transcription_envelope_with_an_amount_adds_only_that_field() {
+        let body = transcription_envelope("你好。", Some(76_390)).unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value, json!({"text": "你好。", "cost_usd_nanos": 76_390}));
+        assert_eq!(value.as_object().unwrap().len(), 2);
     }
 }

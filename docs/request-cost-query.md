@@ -24,6 +24,28 @@ is never forwarded to the model provider.
 Duplicate records for one ID are possible in rare cases (a transport-level
 re-send after a dropped connection); queries return the most recent record.
 
+## Inline receipt
+
+A successful transcription answers with the amount it cost, so a caller that
+keeps the body does not have to query at all:
+
+```json
+{"text": "欢迎使用阿里云。", "cost_usd_nanos": 76390}
+```
+
+- Only `POST /v1/audio/transcriptions` (and its `/audio/transcriptions` alias)
+  states the amount, as a **top-level** `cost_usd_nanos` field — the same shape
+  this API and the console audit use.
+- The value is the amount the audit row books, so the reply, the console audit
+  and `GET /v1/requests/{id}` carry one number. It is never recomputed at reply
+  time.
+- When the upstream reports no usable usage duration the field is omitted, the
+  settlement stays as it always was (0) and the load balancer logs a warning:
+  an unknown amount is not reported as a free call. Fall back to
+  `GET /v1/requests/{id}` in that case.
+- Error replies, `/v1/audio/speech` (WAV bytes) and the console's
+  `POST /api/transcriptions` keep the shapes they have always had.
+
 ## Single record
 
 ```http
