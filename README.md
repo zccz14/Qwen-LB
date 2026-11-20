@@ -61,7 +61,7 @@ curl https://qwen.ntnl.io/v1/audio/transcriptions \
   -F 'language=zh'
 ```
 
-成功时返回 `{"text": "…"}`；`language` 留空或填 `auto` 时由 Qwen 自动识别。
+成功时返回 `{"text": "…", "cost_usd_nanos": 76390}`；`language` 留空或填 `auto` 时由 Qwen 自动识别。`cost_usd_nanos` 是这次调用的实收费用（USD 纳美元），与审计行、`GET /v1/requests/{id}` 同值；上游没有报告用量时长时不写该字段（记账仍为 0，并打一条 warn），此时按请求 ID 查询即可。
 
 语音合成（JSON 请求，返回 WAV 字节流）：
 
@@ -119,7 +119,7 @@ curl https://qwen.ntnl.io/v1/requests/query \
   -d '{"ids":["<REQUEST_ID>","<ANOTHER_ID>"]}'
 ```
 
-金额为实收费用（USD 纳美元，1e-9 USD），恒等于审计账目；查询以 request-id 为凭据，任意有效 Consumer 均可调用，更适合下游异步批量回填。若调用方（如 NormAI）通过请求头 `x-normai-request-id` 提供统一请求 ID，本服务会优先采用它——响应头、费用查询与控制台「请求 ID」三处同值；缺失或非法时生成本服务自己的 UUID。记录不存在时，404 应答在 `error.lb` 里注明本服务为 `qwen`，供上游网关识别负载均衡器来源。字段、重试与回填示例见 [docs/request-cost-query.md](./docs/request-cost-query.md)。
+金额为实收费用（USD 纳美元，1e-9 USD），恒等于审计账目，也恒等于转写应答里内联的 `cost_usd_nanos`；查询以 request-id 为凭据，任意有效 Consumer 均可调用，更适合下游异步批量回填。若调用方（如 NormAI）通过请求头 `x-normai-request-id` 提供统一请求 ID，本服务会优先采用它——响应头、费用查询与控制台「请求 ID」三处同值；缺失或非法时生成本服务自己的 UUID。记录不存在时，404 应答在 `error.lb` 里注明本服务为 `qwen`，供上游网关识别负载均衡器来源。字段、重试与回填示例见 [docs/request-cost-query.md](./docs/request-cost-query.md)。
 
 ## 路由语义
 
@@ -150,7 +150,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features --locked
 ```
 
-CI（`.github/workflows/project-validation.yml`）执行同一组命令，并对依赖树运行 `cargo audit --ignore RUSTSEC-2023-0071`（SQLx 可选 MySQL 驱动记录的传递性告警，SQLite-only 依赖图不含该路径）。
+CI（`.github/workflows/project-validation.yml`）执行同一组命令，并对依赖树运行 `cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459`（前者是 SQLx 可选 MySQL 驱动记录的传递性告警，SQLite-only 依赖图不含该路径；后者是 SQLite 本身的 CVE，修补版只随 sqlx 0.9 提供，而 sqlx 0.9 需要的 rustc 高于本仓库固定的 1.93.0）。
 
 ## 安全说明
 
