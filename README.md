@@ -150,7 +150,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features --locked
 ```
 
-CI（`.github/workflows/project-validation.yml`）执行同一组命令，并对依赖树运行 `cargo audit --ignore RUSTSEC-2023-0071`（SQLx 可选 MySQL 驱动记录的传递性告警，SQLite-only 依赖图不含该路径）。
+CI（`.github/workflows/project-validation.yml`）执行同一组命令，并对依赖树运行 `cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459`（前者是 SQLx 可选 MySQL 驱动记录的传递性告警，SQLite-only 依赖图不含该路径；后者是 SQLite 本身的 CVE，修补版只随 sqlx 0.9 提供，而 sqlx 0.9 需要的 rustc 高于本仓库固定的 1.93.0）。
 
 ## 安全说明
 
